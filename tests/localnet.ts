@@ -93,6 +93,7 @@ assert.ok((await conn.getBalance(game.publicKey)) > before - 10_000, 'rent retur
 console.log('draw 1 closed, rent back');
 // 5. The reference crank reveals a new draw by itself, in order, once its slot passes.
 const { revealNext } = await import('../crank/reveal.js');
+const { parseRevealLog, checkReveal } = await import('../sdk/src/index.js');
 const e = await request();
 let r: Awaited<ReturnType<typeof revealNext>> = 'waiting';
 for (let i = 0; i < 100 && typeof r !== 'object'; i++) {
@@ -102,4 +103,14 @@ for (let i = 0; i < 100 && typeof r !== 'object'; i++) {
 assert.ok(typeof r === 'object' && r.revealed === 5n && r.status === 1, 'crank revealed draw 5');
 assert.equal(await e.status(), 1);
 console.log('crank revealed draw 5');
+// The reveal's log alone re-checks the draw: secret 5 hashes to secret 4 and the result matches.
+{
+  const tx = await conn.getTransaction((r as { signature: string }).signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+  const log = parseRevealLog(tx!.meta!.logMessages!);
+  assert.ok(log && log.index === 5n, 'the reveal logged draw 5');
+  assert.deepEqual(checkReveal(log!, links[4]!), { chainOk: true, resultOk: true });
+  assert.ok((await conn.getAccountInfo(e.draw, 'confirmed'))!.data.subarray(168, 200).equals(log!.result), 'the log matches the account');
+  assert.deepEqual(checkReveal({ ...log!, result: Buffer.alloc(32) }, links[4]!).resultOk, false);
+  console.log('reveal log re-checks the draw');
+}
 console.log('ALL PASSED');

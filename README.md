@@ -33,6 +33,14 @@ Why nobody can steer it:
 - **Someone holding the secrets** still doesn't know the slot hash while entries are open.
 - **Withholding a reveal** only fails the draw (refund). It can't pick an outcome.
 
+## Checking a draw
+
+Every fulfilled reveal logs its inputs and result (`Program data: jumpball reveal <draw> <index>
+<secret> <slot> <slot hash> <result>`), so a draw can be re-checked from the transaction alone, even
+after its account is closed. The SDK's `parseRevealLog` reads it and `checkReveal` confirms that the
+secret hashes to the link committed before it and that the result is
+`H("jumpball" ‖ secret ‖ slot hash ‖ draw)`.
+
 ## Known limitation (and how it's handled)
 
 Whoever holds the secrets can compute a draw's result once its slot hash is known, before

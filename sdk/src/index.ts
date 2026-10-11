@@ -172,3 +172,36 @@ export function hashChain(seed: Uint8Array, length: number): Buffer[] {
 }
 
 export const newSeed = () => randomBytes(32);
+
+/** A fulfilled draw as its reveal logged it ("Program data: jumpball reveal …"). */
+export interface RevealLog {
+  draw: PublicKey;
+  index: bigint;
+  secret: Buffer;
+  slot: bigint;
+  slotHash: Buffer;
+  result: Buffer;
+}
+
+/** Reads the reveal event from a transaction's log lines, if it has one. */
+export function parseRevealLog(logs: readonly string[]): RevealLog | null {
+  for (const line of logs) {
+    if (!line.startsWith('Program data: ')) continue;
+    const f = line.slice(14).split(' ').map((p) => Buffer.from(p, 'base64'));
+    if (f[0]?.toString() !== 'jumpball' || f[1]?.toString() !== 'reveal' || f.length !== 8) continue;
+    return { draw: new PublicKey(f[2]!), index: f[3]!.readBigUInt64LE(0), secret: f[4]!, slot: f[5]!.readBigUInt64LE(0), slotHash: f[6]!, result: f[7]! };
+  }
+  return null;
+}
+
+/**
+ * Re-checks a draw from its reveal log: the secret hashes to the link committed before it (the
+ * previous reveal's secret, or the feed's head when it was the first), and the result is
+ * H("jumpball" ‖ secret ‖ slot hash ‖ draw). The slot hash itself is the chain's (SlotHashes).
+ */
+export function checkReveal(r: RevealLog, previousLink: Uint8Array): { chainOk: boolean; resultOk: boolean } {
+  return {
+    chainOk: sha256(r.secret).equals(Buffer.from(previousLink)),
+    resultOk: createHash('sha256').update('jumpball').update(r.secret).update(r.slotHash).update(r.draw.toBuffer()).digest().equals(r.result),
+  };
+}

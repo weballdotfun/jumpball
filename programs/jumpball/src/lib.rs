@@ -27,6 +27,7 @@ use solana_program::{
     account_info::{next_account_info, AccountInfo},
     clock::Clock,
     entrypoint::ProgramResult,
+    log::sol_log_data,
     msg,
     program::{invoke, invoke_signed},
     program_error::ProgramError,
@@ -287,11 +288,23 @@ fn reveal(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
     ) {
         (_, Timing::TooEarly) => return Err(JumpballError::TooEarly.into()),
         (DrawStatus::Pending, Timing::Open) => {
-            let (_, slot_hash) =
+            let (hash_slot, slot_hash) =
                 first_slot_hash_from(&slot_hashes.try_borrow_data()?, draw.target_slot)
                     .ok_or(JumpballError::SlotHashUnavailable)?;
             draw.result = draw_result(&secret, &slot_hash, draw_acc.key);
             draw.status = DrawStatus::Fulfilled;
+            // Everything needed to re-check the draw from the logs alone, after the account is closed:
+            // H(secret) is the previous link, result = H("jumpball" ‖ secret ‖ slot_hash ‖ draw).
+            sol_log_data(&[
+                b"jumpball",
+                b"reveal",
+                draw_acc.key.as_ref(),
+                &draw.secret_index.to_le_bytes(),
+                &secret,
+                &hash_slot.to_le_bytes(),
+                &slot_hash,
+                &draw.result,
+            ]);
         }
         // Too late: the draw fails (the consumer refunds), and the secret still advances the chain
         // so later draws can be revealed.
