@@ -113,4 +113,58 @@ console.log('crank revealed draw 5');
   assert.deepEqual(checkReveal({ ...log!, result: Buffer.alloc(32) }, links[4]!).resultOk, false);
   console.log('reveal log re-checks the draw');
 }
+// 6. Fees (set by the feed authority; the requester names the most it will pay).
+{
+  const { requestIx, setFeeIx, readFeed } = await import('../sdk/src/index.js');
+  const TOKEN = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+  const sendMany = (ixs: TransactionInstruction[], ...s: Keypair[]) => sendAndConfirmTransaction(conn, new Transaction().add(...ixs), s, { commitment: 'confirmed' });
+  const tokenIx = (data: Buffer, keys: [PublicKey, boolean, boolean][]) =>
+    new TransactionInstruction({ programId: TOKEN, data, keys: keys.map(([pubkey, isSigner, isWritable]) => ({ pubkey, isSigner, isWritable })) });
+  const rent = async (n: number) => conn.getMinimumBalanceForRentExemption(n);
+  const fee = (a: { kind: 'sol' | 'token'; amount: bigint; burnBps: number; account: PublicKey }, signer = operator) =>
+    send(setFeeIx({ program: PROGRAM_ID, authority: signer.publicKey, feed, ...a }), signer);
+  const req = (extra: Partial<Parameters<typeof requestIx>[0]> = {}) => {
+    const nonce = randomBytes(32);
+    return send(requestIx({ program: PROGRAM_ID, payer: game.publicKey, requester: game.publicKey, feed, nonce, ...extra }), game);
+  };
+
+  const wallet = Keypair.generate().publicKey;
+  await custom(fee({ kind: 'sol', amount: 1_000_000n, burnBps: 0, account: wallet }, game), 8); // not the authority
+  await custom(fee({ kind: 'sol', amount: 1_000_000n, burnBps: 100, account: wallet }), 10); // SOL can't burn
+  await fee({ kind: 'sol', amount: 1_000_000n, burnBps: 0, account: wallet });
+  assert.equal(readFeed((await conn.getAccountInfo(feed))!.data).fee.amount, 1_000_000n);
+  await custom(req(), 11); // no maximum given
+  await custom(req({ maxFee: 999_999n, fee: { kind: 'sol', wallet } }), 11); // agreed to less than the fee
+  await custom(req({ maxFee: 1_000_000n, fee: { kind: 'sol', wallet: Keypair.generate().publicKey } }), 7); // wrong wallet
+  await req({ maxFee: 1_000_000n, fee: { kind: 'sol', wallet } });
+  assert.equal(await conn.getBalance(wallet, 'confirmed'), 1_000_000);
+  console.log('SOL fee paid to the fee wallet');
+
+  // A token fee, half burned and half to the fee account (the founder: 50% burned, 50% LP).
+  const mint = Keypair.generate(), payerToken = Keypair.generate(), feeToken = Keypair.generate(), lp = Keypair.generate().publicKey;
+  await sendMany([
+    SystemProgram.createAccount({ fromPubkey: game.publicKey, newAccountPubkey: mint.publicKey, lamports: await rent(82), space: 82, programId: TOKEN }),
+    tokenIx(Buffer.concat([Buffer.from([20, 6]), game.publicKey.toBuffer(), Buffer.from([0])]), [[mint.publicKey, false, true]]),
+    SystemProgram.createAccount({ fromPubkey: game.publicKey, newAccountPubkey: payerToken.publicKey, lamports: await rent(165), space: 165, programId: TOKEN }),
+    tokenIx(Buffer.concat([Buffer.from([18]), game.publicKey.toBuffer()]), [[payerToken.publicKey, false, true], [mint.publicKey, false, false]]),
+    SystemProgram.createAccount({ fromPubkey: game.publicKey, newAccountPubkey: feeToken.publicKey, lamports: await rent(165), space: 165, programId: TOKEN }),
+    tokenIx(Buffer.concat([Buffer.from([18]), lp.toBuffer()]), [[feeToken.publicKey, false, true], [mint.publicKey, false, false]]),
+    tokenIx(Buffer.concat([Buffer.from([7]), u64(10_000_000n)]), [[mint.publicKey, false, true], [payerToken.publicKey, false, true], [game.publicKey, true, false]]),
+  ], game, mint, payerToken, feeToken);
+  const amountOf = async (k: PublicKey) => (await conn.getAccountInfo(k, 'confirmed'))!.data.readBigUInt64LE(64);
+  const supply = async () => (await conn.getAccountInfo(mint.publicKey, 'confirmed'))!.data.readBigUInt64LE(36);
+  await custom(fee({ kind: 'token', amount: 1_000_000n, burnBps: 10_001, account: feeToken.publicKey }), 10);
+  await fee({ kind: 'token', amount: 1_000_001n, burnBps: 5_000, account: feeToken.publicKey });
+  const tokenFee = (feeTok = feeToken.publicKey) => ({ kind: 'token' as const, payerToken: payerToken.publicKey, mint: mint.publicKey, feeToken: feeTok, tokenProgram: TOKEN });
+  await custom(req({ maxFee: 1_000_001n, fee: tokenFee(payerToken.publicKey) }), 7); // wrong fee account
+  await req({ maxFee: 1_000_001n, fee: tokenFee() });
+  assert.equal(await amountOf(payerToken.publicKey), 10_000_000n - 1_000_001n, 'the payer paid the fee');
+  assert.equal(await amountOf(feeToken.publicKey), 500_001n, 'half (rounded up) to the fee account');
+  assert.equal(await supply(), 10_000_000n - 500_000n, 'half burned (rounded down)');
+  console.log('token fee: half burned, half to the fee account');
+
+  await fee({ kind: 'sol', amount: 0n, burnBps: 0, account: PublicKey.default });
+  await req();
+  console.log('fee set back to 0: requests are free again');
+}
 console.log('ALL PASSED');

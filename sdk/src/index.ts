@@ -22,7 +22,16 @@ export interface Feed {
   failures: bigint;
   delaySlots: number;
   timeoutSlots: number;
+  /** Per request: 0 = free. SOL goes to `feeAccount` (a wallet); a token fee to `feeAccount` (a token
+   * account of the fee mint), with `burnBps` of it burned from the payer. */
+  fee: { kind: 'sol' | 'token'; account: PublicKey; amount: bigint; burnBps: number };
 }
+
+/** The accounts a fee needs, appended to a request: SOL → the fee wallet; token → the payer's token
+ * account, the mint, the fee token account and the token program. */
+export type FeeAccounts =
+  | { kind: 'sol'; wallet: PublicKey }
+  | { kind: 'token'; payerToken: PublicKey; mint: PublicKey; feeToken: PublicKey; tokenProgram: PublicKey };
 
 export interface Draw {
   bump: number;
@@ -87,14 +96,47 @@ export function initFeedIx(a: {
   ]);
 }
 
-export function requestIx(a: { program: PublicKey; payer: PublicKey; requester: PublicKey; feed: PublicKey; nonce: Uint8Array }): TransactionInstruction {
+/** A request. On a feed with a fee, pass `maxFee` (the most the payer agrees to) and the fee accounts. */
+export function requestIx(a: {
+  program: PublicKey;
+  payer: PublicKey;
+  requester: PublicKey;
+  feed: PublicKey;
+  nonce: Uint8Array;
+  maxFee?: bigint;
+  fee?: FeeAccounts;
+}): TransactionInstruction {
   const draw = drawAddress(a.program, a.feed, a.requester, a.nonce);
-  return ix(a.program, Buffer.concat([Buffer.from([1]), Buffer.from(a.nonce)]), [
+  const keys: [PublicKey, boolean, boolean][] = [
     [a.payer, true, true],
     [a.requester, true, false],
     [a.feed, false, true],
     [draw, false, true],
     [SystemProgram.programId, false, false],
+  ];
+  if (a.fee?.kind === 'sol') keys.push([a.fee.wallet, false, true]);
+  if (a.fee?.kind === 'token')
+    keys.push([a.fee.payerToken, false, true], [a.fee.mint, false, true], [a.fee.feeToken, false, true], [a.fee.tokenProgram, false, false]);
+  const data = [Buffer.from([1]), Buffer.from(a.nonce)];
+  if (a.maxFee !== undefined) data.push(u64(a.maxFee));
+  return ix(a.program, Buffer.concat(data), keys);
+}
+
+/** The feed authority sets the fee (amount 0 = free; SOL fees can't burn). */
+export function setFeeIx(a: {
+  program: PublicKey;
+  authority: PublicKey;
+  feed: PublicKey;
+  kind: 'sol' | 'token';
+  amount: bigint;
+  burnBps: number;
+  account: PublicKey;
+}): TransactionInstruction {
+  const bps = Buffer.alloc(2);
+  bps.writeUInt16LE(a.burnBps);
+  return ix(a.program, Buffer.concat([Buffer.from([6, a.kind === 'sol' ? 0 : 1]), u64(a.amount), bps, a.account.toBuffer()]), [
+    [a.authority, true, false],
+    [a.feed, false, true],
   ]);
 }
 
@@ -141,6 +183,12 @@ export function readFeed(data: Buffer): Feed {
     failures: data.readBigUInt64LE(104),
     delaySlots: data.readUInt32LE(112),
     timeoutSlots: data.readUInt32LE(116),
+    fee: {
+      kind: data[162] === 1 ? 'token' : 'sol',
+      account: new PublicKey(data.subarray(120, 152)),
+      amount: data.readBigUInt64LE(152),
+      burnBps: data.readUInt16LE(160),
+    },
   };
 }
 

@@ -15,8 +15,17 @@ const DRAW_TAG: [u8; 8] = *b"JBDRAW01";
 
 /// 0 tag [8] · 8 bump u8 · 9 pad [7] · 16 authority [32] · 48 head [32] · 80 id u64 ·
 /// 88 assigned u64 · 96 revealed u64 · 104 failures u64 · 112 delay_slots u32 · 116 timeout_slots u32 ·
-/// 120 reserved [64].
+/// 120 fee_account [32] · 152 fee_amount u64 · 160 burn_bps u16 · 162 fee_kind u8 · 163 reserved [21].
 pub const FEED_LEN: usize = 184;
+
+/// What a feed's fee is paid in: SOL to a wallet, or a token (the mint of `fee_account`), part of
+/// which may be burned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FeeKind {
+    Sol = 0,
+    Token = 1,
+}
 /// 0 tag [8] · 8 bump u8 · 9 status u8 · 10 pad [6] · 16 feed [32] · 48 requester [32] · 80 payer [32] ·
 /// 112 nonce [32] · 144 secret_index u64 · 152 lock_slot u64 · 160 target_slot u64 · 168 result [32] ·
 /// 200 reserved [32].
@@ -59,6 +68,12 @@ pub struct Feed {
     pub delay_slots: u32,
     /// After `target_slot + timeout_slots` without a reveal the draw fails.
     pub timeout_slots: u32,
+    /// The fee for each request (0 = free). SOL: a wallet; token: a token account of the fee mint.
+    pub fee_kind: FeeKind,
+    pub fee_account: Pubkey,
+    pub fee_amount: u64,
+    /// The share of a token fee burned from the payer, in basis points; the rest goes to `fee_account`.
+    pub burn_bps: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +122,10 @@ impl Feed {
         out[104..112].copy_from_slice(&self.failures.to_le_bytes());
         out[112..116].copy_from_slice(&self.delay_slots.to_le_bytes());
         out[116..120].copy_from_slice(&self.timeout_slots.to_le_bytes());
+        out[120..152].copy_from_slice(self.fee_account.as_ref());
+        out[152..160].copy_from_slice(&self.fee_amount.to_le_bytes());
+        out[160..162].copy_from_slice(&self.burn_bps.to_le_bytes());
+        out[162] = self.fee_kind as u8;
         Ok(())
     }
 
@@ -124,6 +143,14 @@ impl Feed {
             failures: u64_at(d, 104),
             delay_slots: u32_at(d, 112),
             timeout_slots: u32_at(d, 116),
+            fee_account: key_at(d, 120),
+            fee_amount: u64_at(d, 152),
+            burn_bps: u16::from_le_bytes([d[160], d[161]]),
+            fee_kind: match d[162] {
+                0 => FeeKind::Sol,
+                1 => FeeKind::Token,
+                _ => return Err(ProgramError::InvalidAccountData),
+            },
         })
     }
 }
@@ -183,6 +210,10 @@ mod tests {
             failures: 1,
             delay_slots: 2,
             timeout_slots: 150,
+            fee_kind: FeeKind::Token,
+            fee_account: Pubkey::new_unique(),
+            fee_amount: 1_000_000,
+            burn_bps: 5_000,
         };
         let mut buf = vec![0u8; FEED_LEN];
         f.write(&mut buf).unwrap();

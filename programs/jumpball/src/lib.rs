@@ -27,6 +27,7 @@ use solana_program::{
     account_info::{next_account_info, AccountInfo},
     clock::Clock,
     entrypoint::ProgramResult,
+    instruction::{AccountMeta, Instruction},
     log::sol_log_data,
     msg,
     program::{invoke, invoke_signed},
@@ -38,7 +39,7 @@ use solana_program::{
 use solana_system_interface::{instruction as system_instruction, program as system_program};
 
 use crate::logic::{draw_result, first_slot_hash_from, is_next_link, timing, Timing};
-use crate::state::{Draw, DrawStatus, Feed, DRAW_LEN, DRAW_SEED, FEED_LEN, FEED_SEED};
+use crate::state::{Draw, DrawStatus, FeeKind, Feed, DRAW_LEN, DRAW_SEED, FEED_LEN, FEED_SEED};
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
@@ -70,7 +71,13 @@ pub enum JumpballError {
     DrawsPending = 9,
     /// A setting is out of range.
     BadSetting = 10,
+    /// The feed's fee is more than the request said it would pay.
+    FeeTooHigh = 11,
 }
+
+/// The two token programs a token fee may use (the same TransferChecked and BurnChecked layouts).
+const SPL_TOKEN: Pubkey = Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const TOKEN_2022: Pubkey = Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
 impl From<JumpballError> for ProgramError {
     fn from(e: JumpballError) -> Self {
@@ -93,6 +100,7 @@ pub fn process_instruction(
         3 => expire(program_id, accounts),
         4 => close_draw(program_id, accounts),
         5 => recommit(program_id, accounts, data),
+        6 => set_fee(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -182,6 +190,11 @@ fn init_feed(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
         failures: 0,
         delay_slots,
         timeout_slots,
+        // Free until the authority sets a fee.
+        fee_kind: FeeKind::Sol,
+        fee_account: Pubkey::default(),
+        fee_amount: 0,
+        burn_bps: 0,
     }
     .write(&mut feed_acc.try_borrow_mut_data()?)?;
     msg!("jumpball: feed {} committed", id);
@@ -202,7 +215,17 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progra
         return Err(ProgramError::IncorrectProgramId);
     }
     let nonce = arr32(data, 0)?;
+    // The most the requester will pay (optional; none means 0), so a fee raised after the request
+    // was built can't charge more than it agreed to.
+    let max_fee = if data.len() >= 40 {
+        u64_at(data, 32)?
+    } else {
+        0
+    };
     let mut feed = load_feed(program_id, feed_acc)?;
+    if feed.fee_amount > max_fee {
+        return Err(JumpballError::FeeTooHigh.into());
+    }
     let (key, bump) = Pubkey::find_program_address(
         &[
             DRAW_SEED,
@@ -248,11 +271,163 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progra
     };
     draw.write(&mut draw_acc.try_borrow_mut_data()?)?;
     feed.write(&mut feed_acc.try_borrow_mut_data()?)?;
+    if feed.fee_amount > 0 {
+        pay_fee(&feed, payer, system, draw_acc.key, it)?;
+    }
     msg!(
         "jumpball: draw {} locked at slot {}, target {}",
         draw.secret_index,
         now,
         draw.target_slot
+    );
+    Ok(())
+}
+
+/// Takes the feed's fee from the payer. SOL: [fee wallet]. Token: [payer's token account, mint, fee
+/// token account, token program]; `burn_bps` of it is burned from the payer, the rest transferred.
+fn pay_fee<'a, 'b>(
+    feed: &Feed,
+    payer: &'b AccountInfo<'a>,
+    system: &'b AccountInfo<'a>,
+    draw: &Pubkey,
+    it: &mut core::slice::Iter<'b, AccountInfo<'a>>,
+) -> ProgramResult {
+    let amount = feed.fee_amount;
+    let mut burned = 0u64;
+    match feed.fee_kind {
+        FeeKind::Sol => {
+            let wallet = next_account_info(it)?;
+            if *wallet.key != feed.fee_account {
+                return Err(JumpballError::WrongAccount.into());
+            }
+            invoke(
+                &system_instruction::transfer(payer.key, wallet.key, amount),
+                &[payer.clone(), wallet.clone(), system.clone()],
+            )?;
+        }
+        FeeKind::Token => {
+            let source = next_account_info(it)?;
+            let mint = next_account_info(it)?;
+            let dest = next_account_info(it)?;
+            let token_program = next_account_info(it)?;
+            let tp = *token_program.key;
+            if tp != SPL_TOKEN && tp != TOKEN_2022 {
+                return Err(ProgramError::IncorrectProgramId);
+            }
+            if *dest.key != feed.fee_account || *dest.owner != tp || *mint.owner != tp {
+                return Err(JumpballError::WrongAccount.into());
+            }
+            // The fee account's mint (a token account starts with it) must be the mint passed.
+            if dest.try_borrow_data()?.get(0..32) != Some(mint.key.as_ref()) {
+                return Err(JumpballError::WrongAccount.into());
+            }
+            let decimals = *mint
+                .try_borrow_data()?
+                .get(44)
+                .ok_or(ProgramError::InvalidAccountData)?;
+            burned = ((amount as u128 * feed.burn_bps as u128) / 10_000) as u64;
+            let rest = amount - burned;
+            let ix = |tag: u8, value: u64, accounts: Vec<AccountMeta>| Instruction {
+                program_id: tp,
+                accounts,
+                data: [&[tag][..], &value.to_le_bytes(), &[decimals]].concat(),
+            };
+            if burned > 0 {
+                // BurnChecked: account, mint, owner.
+                invoke(
+                    &ix(
+                        15,
+                        burned,
+                        vec![
+                            AccountMeta::new(*source.key, false),
+                            AccountMeta::new(*mint.key, false),
+                            AccountMeta::new_readonly(*payer.key, true),
+                        ],
+                    ),
+                    &[
+                        source.clone(),
+                        mint.clone(),
+                        payer.clone(),
+                        token_program.clone(),
+                    ],
+                )?;
+            }
+            if rest > 0 {
+                // TransferChecked: source, mint, destination, owner.
+                invoke(
+                    &ix(
+                        12,
+                        rest,
+                        vec![
+                            AccountMeta::new(*source.key, false),
+                            AccountMeta::new_readonly(*mint.key, false),
+                            AccountMeta::new(*dest.key, false),
+                            AccountMeta::new_readonly(*payer.key, true),
+                        ],
+                    ),
+                    &[
+                        source.clone(),
+                        mint.clone(),
+                        dest.clone(),
+                        payer.clone(),
+                        token_program.clone(),
+                    ],
+                )?;
+            }
+        }
+    }
+    sol_log_data(&[
+        b"jumpball",
+        b"fee",
+        draw.as_ref(),
+        &[feed.fee_kind as u8],
+        &amount.to_le_bytes(),
+        &burned.to_le_bytes(),
+    ]);
+    Ok(())
+}
+
+/// The feed authority sets the fee: kind u8 (0 SOL, 1 token) · amount u64 · burn_bps u16 ·
+/// fee_account [32]. Amount 0 makes the feed free. SOL can't be burned, so SOL fees burn nothing.
+fn set_fee(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let it = &mut accounts.iter();
+    let authority = next_account_info(it)?;
+    let feed_acc = next_account_info(it)?;
+    if !authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let mut feed = load_feed(program_id, feed_acc)?;
+    if feed.authority != *authority.key {
+        return Err(JumpballError::Unauthorized.into());
+    }
+    let kind = match data.first() {
+        Some(0) => FeeKind::Sol,
+        Some(1) => FeeKind::Token,
+        _ => return Err(JumpballError::BadSetting.into()),
+    };
+    let amount = u64_at(data, 1)?;
+    let burn_bps = u16::from_le_bytes(
+        data.get(9..11)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(ProgramError::InvalidInstructionData)?,
+    );
+    let account = Pubkey::new_from_array(arr32(data, 11)?);
+    if burn_bps > 10_000 || (kind == FeeKind::Sol && burn_bps > 0) {
+        return Err(JumpballError::BadSetting.into());
+    }
+    if amount > 0 && account == Pubkey::default() {
+        return Err(JumpballError::BadSetting.into());
+    }
+    feed.fee_kind = kind;
+    feed.fee_amount = amount;
+    feed.burn_bps = burn_bps;
+    feed.fee_account = account;
+    feed.write(&mut feed_acc.try_borrow_mut_data()?)?;
+    msg!(
+        "jumpball: fee set to {} ({:?}, {} bps burned)",
+        amount,
+        kind,
+        burn_bps
     );
     Ok(())
 }

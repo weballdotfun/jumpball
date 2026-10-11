@@ -41,6 +41,15 @@ after its account is closed. The SDK's `parseRevealLog` reads it and `checkRevea
 secret hashes to the link committed before it and that the result is
 `H("jumpball" ‖ secret ‖ slot hash ‖ draw)`.
 
+## Fees
+
+A feed may charge for each request, set by its authority with `set_fee` (instruction 6): an amount in
+SOL (paid to a wallet) or in a token (paid to a token account of that mint, SPL Token or Token-2022),
+with a share of a token fee burned from the payer (`burn_bps`). A request names the most it will pay
+(`max_fee`, the 8 bytes after the nonce), so a fee raised after a request was built can't charge more
+than it agreed to. New feeds are free. Every fee paid logs `Program data: jumpball fee <draw> <kind>
+<amount> <burned>`.
+
 ## Known limitation (and how it's handled)
 
 Whoever holds the secrets can compute a draw's result once its slot hash is known, before
@@ -64,6 +73,7 @@ failures as a free "undo" on rounds that player lost. Mitigations:
 | 3 | `expire` | Anyone fails a draw whose reveal window closed (the consumer refunds). |
 | 4 | `close_draw` | The requester closes a settled draw and its payer gets the rent back. |
 | 5 | `recommit` | The operator commits a new chain once every assigned secret is revealed. |
+| 6 | `set_fee` | The operator sets the per-request fee: SOL to a wallet, or a token with part burned. |
 
 The target slot is `lock + delay_slots`; if that slot was skipped, the first produced slot after it
 is used. The reveal window must fit in the 512 slots the SlotHashes sysvar keeps.
