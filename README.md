@@ -64,10 +64,10 @@ is used. The reveal window must fit in the 512 slots the SlotHashes sysvar keeps
 
 ```
 programs/jumpball   the on-chain program (Rust, no framework)
+sdk/                TypeScript client: addresses, instructions, account readers, hash chain
+crank/              reference crank: reveals a feed's draws in order, automatically
 tests/              end-to-end test on a local validator
 ```
-
-A TypeScript client and a reference crank will follow.
 
 ## Build and test
 

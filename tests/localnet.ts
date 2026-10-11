@@ -91,4 +91,15 @@ await send(ix(Buffer.from([4]), [[game.publicKey, true, false], [a.draw, false, 
 assert.equal(await conn.getAccountInfo(a.draw), null);
 assert.ok((await conn.getBalance(game.publicKey)) > before - 10_000, 'rent returned (less the fee)');
 console.log('draw 1 closed, rent back');
+// 5. The reference crank reveals a new draw by itself, in order, once its slot passes.
+const { revealNext } = await import('../crank/reveal.js');
+const e = await request();
+let r: Awaited<ReturnType<typeof revealNext>> = 'waiting';
+for (let i = 0; i < 100 && typeof r !== 'object'; i++) {
+  r = await revealNext(conn, PROGRAM_ID, operator, id, links);
+  if (typeof r !== 'object') await new Promise((res) => setTimeout(res, 300));
+}
+assert.ok(typeof r === 'object' && r.revealed === 5n && r.status === 1, 'crank revealed draw 5');
+assert.equal(await e.status(), 1);
+console.log('crank revealed draw 5');
 console.log('ALL PASSED');
