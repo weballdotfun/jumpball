@@ -15,7 +15,8 @@ const DRAW_TAG: [u8; 8] = *b"JBDRAW01";
 
 /// 0 tag [8] · 8 bump u8 · 9 pad [7] · 16 authority [32] · 48 head [32] · 80 id u64 ·
 /// 88 assigned u64 · 96 revealed u64 · 104 failures u64 · 112 delay_slots u32 · 116 timeout_slots u32 ·
-/// 120 fee_account [32] · 152 fee_amount u64 · 160 burn_bps u16 · 162 fee_kind u8 · 163 reserved [21].
+/// 120 fee_account [32] · 152 fee_amount u64 · 160 burn_bps u16 · 162 fee_kind u8 · 163 pad [5] ·
+/// 168 chain_end u64 · 176 reserved [8].
 pub const FEED_LEN: usize = 184;
 
 /// What a feed's fee is paid in: SOL to a wallet, or a token (the mint of `fee_account`), part of
@@ -74,6 +75,9 @@ pub struct Feed {
     pub fee_amount: u64,
     /// The share of a token fee burned from the payer, in basis points; the rest goes to `fee_account`.
     pub burn_bps: u16,
+    /// The last secret index the committed chain covers: requests stop there until the operator
+    /// commits a new chain, so no draw is ever assigned a secret that doesn't exist.
+    pub chain_end: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +130,7 @@ impl Feed {
         out[152..160].copy_from_slice(&self.fee_amount.to_le_bytes());
         out[160..162].copy_from_slice(&self.burn_bps.to_le_bytes());
         out[162] = self.fee_kind as u8;
+        out[168..176].copy_from_slice(&self.chain_end.to_le_bytes());
         Ok(())
     }
 
@@ -151,6 +156,7 @@ impl Feed {
                 1 => FeeKind::Token,
                 _ => return Err(ProgramError::InvalidAccountData),
             },
+            chain_end: u64_at(d, 168),
         })
     }
 }
@@ -214,6 +220,7 @@ mod tests {
             fee_account: Pubkey::new_unique(),
             fee_amount: 1_000_000,
             burn_bps: 5_000,
+            chain_end: 1_000,
         };
         let mut buf = vec![0u8; FEED_LEN];
         f.write(&mut buf).unwrap();

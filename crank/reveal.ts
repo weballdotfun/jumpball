@@ -44,8 +44,11 @@ export async function revealNext(
   if (!next) return 'none'; // assigned but not visible yet: next tick
   const slot = await conn.getSlot('confirmed');
   if (BigInt(slot) <= next.draw.targetSlot) return 'waiting';
-  const secret = links[Number(index)];
-  if (!secret) throw new Error(`the chain has no secret ${index}: recommit a longer one`);
+  // `links` is the current chain (links[0] its committed head): it covers the secrets up to
+  // chainEnd, so the i-th secret of this chain is index - (chainEnd - length).
+  const start = feed.chainEnd - BigInt(links.length - 1);
+  const secret = index > start ? links[Number(index - start)] : undefined;
+  if (!secret) throw new Error(`the chain has no secret ${index}: is this the feed's current chain?`);
   const signature = await sendAndConfirmTransaction(
     conn,
     new Transaction().add(revealIx({ program, authority: authority.publicKey, feed: feedKey, draw: next.address, secret })),

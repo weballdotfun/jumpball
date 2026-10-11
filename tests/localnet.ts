@@ -34,7 +34,7 @@ const links = chain(10);
 const id = 1n;
 const [feed] = PublicKey.findProgramAddressSync([Buffer.from('feed'), operator.publicKey.toBuffer(), u64(id)], PROGRAM_ID);
 const DELAY = 2, TIMEOUT = 20;
-await send(ix(Buffer.concat([Buffer.from([0]), u64(id), links[0]!, u32(DELAY), u32(TIMEOUT)]),
+await send(ix(Buffer.concat([Buffer.from([0]), u64(id), links[0]!, u32(DELAY), u32(TIMEOUT), u64(BigInt(links.length - 1))]),
   [[operator.publicKey, true, true], [operator.publicKey, true, false], [feed, false, true], [SystemProgram.programId, false, false]]), operator);
 
 const drawKey = (nonce: Buffer) => PublicKey.findProgramAddressSync([Buffer.from('draw'), feed.toBuffer(), game.publicKey.toBuffer(), nonce], PROGRAM_ID)[0];
@@ -166,5 +166,27 @@ console.log('crank revealed draw 5');
   await fee({ kind: 'sol', amount: 0n, burnBps: 0, account: PublicKey.default });
   await req();
   console.log('fee set back to 0: requests are free again');
+}
+// 7. The chain runs out: requests stop at its end (never a draw without a secret), the waiting draws
+// are revealed, then a new chain is committed and requests resume.
+{
+  const { requestIx, recommitIx, readFeed, hashChain } = await import('../sdk/src/index.js');
+  const feedNow = async () => readFeed((await conn.getAccountInfo(feed, 'confirmed'))!.data);
+  const req = () => send(requestIx({ program: PROGRAM_ID, payer: game.publicKey, requester: game.publicKey, feed, nonce: randomBytes(32) }), game);
+  while ((await feedNow()).assigned < (await feedNow()).chainEnd) await req();
+  await custom(req(), 12); // ChainExhausted
+  const fresh = hashChain(randomBytes(32), 5);
+  await custom(send(recommitIx({ program: PROGRAM_ID, authority: operator.publicKey, feed, head: fresh[0]!, chainLength: 5n }), operator), 9); // draws still waiting
+  for (let i = 0; i < 400 && (await feedNow()).revealed < (await feedNow()).assigned; i++) {
+    const r = await revealNext(conn, PROGRAM_ID, operator, id, links);
+    if (typeof r !== 'object') await new Promise((res) => setTimeout(res, 300));
+  }
+  const done = await feedNow();
+  assert.equal(done.revealed, done.assigned, 'every waiting draw revealed or failed');
+  await custom(send(recommitIx({ program: PROGRAM_ID, authority: operator.publicKey, feed, head: fresh[0]!, chainLength: 0n }), operator), 10);
+  await send(recommitIx({ program: PROGRAM_ID, authority: operator.publicKey, feed, head: fresh[0]!, chainLength: 5n }), operator);
+  assert.equal((await feedNow()).chainEnd, done.revealed + 5n);
+  await req();
+  console.log('chain ran out: requests stopped, waiting draws revealed, new chain committed, requests resumed');
 }
 console.log('ALL PASSED');

@@ -73,6 +73,8 @@ pub enum JumpballError {
     BadSetting = 10,
     /// The feed's fee is more than the request said it would pay.
     FeeTooHigh = 11,
+    /// The committed chain's secrets are all assigned: the operator must commit a new chain.
+    ChainExhausted = 12,
 }
 
 /// The two token programs a token fee may use (the same TransferChecked and BurnChecked layouts).
@@ -158,6 +160,11 @@ fn init_feed(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
     let head = arr32(data, 8)?;
     let delay_slots = u32_at(data, 40)?;
     let timeout_slots = u32_at(data, 44)?;
+    // How many secrets the chain holds (links after the head).
+    let chain_length = u64_at(data, 48)?;
+    if chain_length == 0 {
+        return Err(JumpballError::BadSetting.into());
+    }
     // At least one slot of delay (the lock slot's own hash is known to its leader), and a reveal
     // window that stays inside what SlotHashes remembers.
     if delay_slots == 0
@@ -195,6 +202,7 @@ fn init_feed(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
         fee_account: Pubkey::default(),
         fee_amount: 0,
         burn_bps: 0,
+        chain_end: chain_length,
     }
     .write(&mut feed_acc.try_borrow_mut_data()?)?;
     msg!("jumpball: feed {} committed", id);
@@ -225,6 +233,11 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progra
     let mut feed = load_feed(program_id, feed_acc)?;
     if feed.fee_amount > max_fee {
         return Err(JumpballError::FeeTooHigh.into());
+    }
+    // Never assign a secret past the chain: otherwise the feed could only be unstuck by a new chain,
+    // which can't be committed while draws are waiting.
+    if feed.assigned >= feed.chain_end {
+        return Err(JumpballError::ChainExhausted.into());
     }
     let (key, bump) = Pubkey::find_program_address(
         &[
@@ -573,7 +586,15 @@ fn recommit(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
     if feed.revealed != feed.assigned {
         return Err(JumpballError::DrawsPending.into());
     }
+    let chain_length = u64_at(data, 32)?;
+    if chain_length == 0 {
+        return Err(JumpballError::BadSetting.into());
+    }
     feed.head = arr32(data, 0)?;
+    feed.chain_end = feed
+        .revealed
+        .checked_add(chain_length)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
     feed.write(&mut feed_acc.try_borrow_mut_data()?)?;
     msg!(
         "jumpball: feed {} recommitted at draw {}",

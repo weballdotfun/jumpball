@@ -25,6 +25,8 @@ export interface Feed {
   /** Per request: 0 = free. SOL goes to `feeAccount` (a wallet); a token fee to `feeAccount` (a token
    * account of the fee mint), with `burnBps` of it burned from the payer. */
   fee: { kind: 'sol' | 'token'; account: PublicKey; amount: bigint; burnBps: number };
+  /** The last secret index the committed chain covers (requests stop there until a recommit). */
+  chainEnd: bigint;
 }
 
 /** The accounts a fee needs, appended to a request: SOL → the fee wallet; token → the payer's token
@@ -86,9 +88,11 @@ export function initFeedIx(a: {
   head: Uint8Array;
   delaySlots: number;
   timeoutSlots: number;
+  /** How many secrets the chain holds (`hashChain(seed, n)` → n). */
+  chainLength: bigint;
 }): TransactionInstruction {
   const feed = feedAddress(a.program, a.authority, a.id);
-  return ix(a.program, Buffer.concat([Buffer.from([0]), u64(a.id), Buffer.from(a.head), u32(a.delaySlots), u32(a.timeoutSlots)]), [
+  return ix(a.program, Buffer.concat([Buffer.from([0]), u64(a.id), Buffer.from(a.head), u32(a.delaySlots), u32(a.timeoutSlots), u64(a.chainLength)]), [
     [a.payer, true, true],
     [a.authority, true, false],
     [feed, false, true],
@@ -164,8 +168,8 @@ export function closeDrawIx(a: { program: PublicKey; requester: PublicKey; draw:
   ]);
 }
 
-export function recommitIx(a: { program: PublicKey; authority: PublicKey; feed: PublicKey; head: Uint8Array }): TransactionInstruction {
-  return ix(a.program, Buffer.concat([Buffer.from([5]), Buffer.from(a.head)]), [
+export function recommitIx(a: { program: PublicKey; authority: PublicKey; feed: PublicKey; head: Uint8Array; chainLength: bigint }): TransactionInstruction {
+  return ix(a.program, Buffer.concat([Buffer.from([5]), Buffer.from(a.head), u64(a.chainLength)]), [
     [a.authority, true, false],
     [a.feed, false, true],
   ]);
@@ -183,6 +187,7 @@ export function readFeed(data: Buffer): Feed {
     failures: data.readBigUInt64LE(104),
     delaySlots: data.readUInt32LE(112),
     timeoutSlots: data.readUInt32LE(116),
+    chainEnd: data.readBigUInt64LE(168),
     fee: {
       kind: data[162] === 1 ? 'token' : 'sol',
       account: new PublicKey(data.subarray(120, 152)),

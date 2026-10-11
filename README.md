@@ -41,6 +41,13 @@ after its account is closed. The SDK's `parseRevealLog` reads it and `checkRevea
 secret hashes to the link committed before it and that the result is
 `H("jumpball" ‖ secret ‖ slot hash ‖ draw)`.
 
+## When a chain runs out
+
+A feed knows how many secrets its committed chain holds (`chain_end`). Requests stop there
+(`ChainExhausted`), so a draw is never assigned a secret that doesn't exist; the operator reveals
+the waiting draws and commits a new chain, and requests resume. A new chain can't be committed while
+draws are waiting, so the operator can't pick a chain after seeing a draw's slot hash.
+
 ## Fees
 
 A feed may charge for each request, set by its authority with `set_fee` (instruction 6): an amount in
@@ -67,12 +74,12 @@ failures as a free "undo" on rounds that player lost. Mitigations:
 
 | # | Instruction | What it does |
 |---|---|---|
-| 0 | `init_feed` | An operator commits a hash chain (`head = s_0`), with the slot delay and reveal window. |
+| 0 | `init_feed` | An operator commits a hash chain (`head = s_0`) and its length, with the slot delay and reveal window. |
 | 1 | `request` | A consumer locks a draw at the current slot; it is assigned the feed's next secret. |
 | 2 | `reveal` | The operator reveals that secret; the result is `H("jumpball" ‖ secret ‖ slot hash ‖ draw)`. |
 | 3 | `expire` | Anyone fails a draw whose reveal window closed (the consumer refunds). |
 | 4 | `close_draw` | The requester closes a settled draw and its payer gets the rent back. |
-| 5 | `recommit` | The operator commits a new chain once every assigned secret is revealed. |
+| 5 | `recommit` | The operator commits a new chain (and its length) once every assigned secret is revealed. |
 | 6 | `set_fee` | The operator sets the per-request fee: SOL to a wallet, or a token with part burned. |
 
 The target slot is `lock + delay_slots`; if that slot was skipped, the first produced slot after it
