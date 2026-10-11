@@ -1,0 +1,6 @@
+target/
+node_modules/
+*.so
+test-ledger/
+.env
+*.keypair.json

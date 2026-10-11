@@ -1,0 +1,5 @@
+# The same Rust in CI and locally (CI installs it through rustup from this file).
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

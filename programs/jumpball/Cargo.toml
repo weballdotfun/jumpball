@@ -1,0 +1,23 @@
+# Jumpball: provably fair randomness for Solana programs (commit-reveal + slot hash).
+# Dependencies are pinned exactly and were published more than 14 days before they were added.
+[package]
+name = "jumpball"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Provably fair, low-cost randomness for Solana programs: a committed hash chain mixed with a future slot hash."
+repository = "https://github.com/weballdotfun/jumpball"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+no-entrypoint = []
+
+[dependencies]
+solana-program = "=3.0.0"
+solana-system-interface = { version = "=2.0.0", features = ["bincode"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))', 'cfg(feature, values("custom-heap", "custom-panic"))'] }

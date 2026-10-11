@@ -33,13 +33,48 @@ Why nobody can steer it:
 - **Someone holding the secrets** still doesn't know the slot hash while entries are open.
 - **Withholding a reveal** only fails the draw (refund). It can't pick an outcome.
 
-## Layout (planned)
+## Known limitation (and how it's handled)
+
+Whoever holds the secrets can compute a draw's result once its slot hash is known, before
+revealing it, and could choose **not** to reveal. That can't pick an outcome: the draw simply fails
+and the consuming program refunds. But a dishonest operator colluding with a player could use
+failures as a free "undo" on rounds that player lost. Mitigations:
+
+- Reveals are sent automatically by a crank as soon as the slot hash exists, with no human in the
+  loop.
+- Every failed draw is counted on chain in the feed (`failures`) and is public; a rising count is a
+  red flag anyone can see.
+- Consuming programs should cap what one player can put into a single draw.
+
+## Program
+
+| # | Instruction | What it does |
+|---|---|---|
+| 0 | `init_feed` | An operator commits a hash chain (`head = s_0`), with the slot delay and reveal window. |
+| 1 | `request` | A consumer locks a draw at the current slot; it is assigned the feed's next secret. |
+| 2 | `reveal` | The operator reveals that secret; the result is `H("jumpball" ‖ secret ‖ slot hash ‖ draw)`. |
+| 3 | `expire` | Anyone fails a draw whose reveal window closed (the consumer refunds). |
+| 4 | `close_draw` | The requester closes a settled draw and its payer gets the rent back. |
+| 5 | `recommit` | The operator commits a new chain once every assigned secret is revealed. |
+
+The target slot is `lock + delay_slots`; if that slot was skipped, the first produced slot after it
+is used. The reveal window must fit in the 512 slots the SlotHashes sysvar keeps.
+
+## Layout
 
 ```
-programs/jumpball   the on-chain program (Rust)
-sdk/                TypeScript client
-crank/              reference crank: lock, reveal, timeout
-tests/              localnet tests
+programs/jumpball   the on-chain program (Rust, no framework)
+tests/              end-to-end test on a local validator
+```
+
+A TypeScript client and a reference crank will follow.
+
+## Build and test
+
+```
+cargo test                                  # unit tests
+cargo-build-sbf --sbf-out-dir target/deploy # build the program
+npm install && bash tests/run-localnet.sh   # end-to-end on its own local validator
 ```
 
 ## Verifying a deployment
