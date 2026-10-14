@@ -10,7 +10,12 @@ export enum DrawStatus {
   Pending = 0,
   Fulfilled = 1,
   Failed = 2,
+  /** Settled by `force_settle` from slot hashes after a missed reveal. Settles like Fulfilled. */
+  Forced = 3,
 }
+
+/** A settled draw (revealed or forced): the consumer pays out on its result. Failed means refund. */
+export const isSettled = (s: DrawStatus) => s === DrawStatus.Fulfilled || s === DrawStatus.Forced;
 
 export interface Feed {
   bump: number;
@@ -27,6 +32,10 @@ export interface Feed {
   fee: { kind: 'sol' | 'token'; account: PublicKey; amount: bigint; burnBps: number };
   /** The last secret index the committed chain covers (requests stop there until a recommit). */
   chainEnd: bigint;
+  /** Slots after the reveal window before the fallback slot (0 = no fallback: a missed reveal fails). */
+  fallbackDelaySlots: number;
+  /** Draws settled by the fallback instead of a reveal (each one is a missed reveal). */
+  forced: bigint;
 }
 
 /** The accounts a fee needs, appended to a request: SOL → the fee wallet; token → the payer's token
@@ -46,6 +55,8 @@ export interface Draw {
   lockSlot: bigint;
   targetSlot: bigint;
   result: Buffer;
+  /** For a forced draw, the produced slot whose hash settled it; 0n otherwise. */
+  fallbackSlot: bigint;
 }
 
 const u64 = (n: bigint) => {
@@ -90,9 +101,20 @@ export function initFeedIx(a: {
   timeoutSlots: number;
   /** How many secrets the chain holds (`hashChain(seed, n)` → n). */
   chainLength: bigint;
+  /** Slots after the reveal window before the fallback slot; 0 (the default) = no fallback. */
+  fallbackDelaySlots?: number;
 }): TransactionInstruction {
   const feed = feedAddress(a.program, a.authority, a.id);
-  return ix(a.program, Buffer.concat([Buffer.from([0]), u64(a.id), Buffer.from(a.head), u32(a.delaySlots), u32(a.timeoutSlots), u64(a.chainLength)]), [
+  const data = Buffer.concat([
+    Buffer.from([0]),
+    u64(a.id),
+    Buffer.from(a.head),
+    u32(a.delaySlots),
+    u32(a.timeoutSlots),
+    u64(a.chainLength),
+    u32(a.fallbackDelaySlots ?? 0),
+  ]);
+  return ix(a.program, data, [
     [a.payer, true, true],
     [a.authority, true, false],
     [feed, false, true],
@@ -160,6 +182,20 @@ export function expireIx(a: { program: PublicKey; feed: PublicKey; draw: PublicK
   ]);
 }
 
+/** Anyone settles a withheld draw from slot hashes, once the fallback slot has passed. */
+export function forceSettleIx(a: { program: PublicKey; caller: PublicKey; feed: PublicKey; draw: PublicKey }): TransactionInstruction {
+  return ix(a.program, Buffer.from([7]), [
+    [a.caller, true, false],
+    [a.feed, false, true],
+    [a.draw, false, true],
+    [SYSVAR_SLOT_HASHES_PUBKEY, false, false],
+  ]);
+}
+
+/** The slot whose hash (or the next produced one's) settles a withheld draw. */
+export const fallbackSlot = (targetSlot: bigint, timeoutSlots: number, fallbackDelaySlots: number) =>
+  targetSlot + BigInt(timeoutSlots) + BigInt(fallbackDelaySlots);
+
 export function closeDrawIx(a: { program: PublicKey; requester: PublicKey; draw: PublicKey; payer: PublicKey }): TransactionInstruction {
   return ix(a.program, Buffer.from([4]), [
     [a.requester, true, false],
@@ -176,7 +212,7 @@ export function recommitIx(a: { program: PublicKey; authority: PublicKey; feed: 
 }
 
 export function readFeed(data: Buffer): Feed {
-  if (data.length !== 184 || data.subarray(0, 8).toString() !== 'JBFEED01') throw new Error('not a Jumpball feed');
+  if (data.length !== 200 || data.subarray(0, 8).toString() !== 'JBFEED02') throw new Error('not a Jumpball feed');
   return {
     bump: data[8]!,
     authority: new PublicKey(data.subarray(16, 48)),
@@ -188,6 +224,8 @@ export function readFeed(data: Buffer): Feed {
     delaySlots: data.readUInt32LE(112),
     timeoutSlots: data.readUInt32LE(116),
     chainEnd: data.readBigUInt64LE(168),
+    fallbackDelaySlots: data.readUInt32LE(176),
+    forced: data.readBigUInt64LE(184),
     fee: {
       kind: data[162] === 1 ? 'token' : 'sol',
       account: new PublicKey(data.subarray(120, 152)),
@@ -210,6 +248,7 @@ export function readDraw(data: Buffer): Draw {
     lockSlot: data.readBigUInt64LE(152),
     targetSlot: data.readBigUInt64LE(160),
     result: Buffer.from(data.subarray(168, 200)),
+    fallbackSlot: data.readBigUInt64LE(200),
   };
 }
 
@@ -257,4 +296,58 @@ export function checkReveal(r: RevealLog, previousLink: Uint8Array): { chainOk: 
     chainOk: sha256(r.secret).equals(Buffer.from(previousLink)),
     resultOk: createHash('sha256').update('jumpball').update(r.secret).update(r.slotHash).update(r.draw.toBuffer()).digest().equals(r.result),
   };
+}
+
+/** A forced draw as force_settle logged it ("Program data: jumpball forced …"). */
+export interface ForcedLog {
+  draw: PublicKey;
+  index: bigint;
+  /** The produced slot used for the target (the draw's target slot, or the next one if skipped). */
+  targetSlot: bigint;
+  targetHash: Buffer;
+  /** The produced slot used for the fallback. */
+  fallbackSlot: bigint;
+  fallbackHash: Buffer;
+  result: Buffer;
+}
+
+/** Reads the forced-settle event from a transaction's log lines, if it has one. */
+export function parseForcedLog(logs: readonly string[]): ForcedLog | null {
+  for (const line of logs) {
+    if (!line.startsWith('Program data: ')) continue;
+    const f = line.slice(14).split(' ').map((p) => Buffer.from(p, 'base64'));
+    if (f[0]?.toString() !== 'jumpball' || f[1]?.toString() !== 'forced' || f.length !== 9) continue;
+    return {
+      draw: new PublicKey(f[2]!),
+      index: f[3]!.readBigUInt64LE(0),
+      targetSlot: f[4]!.readBigUInt64LE(0),
+      targetHash: f[5]!,
+      fallbackSlot: f[6]!.readBigUInt64LE(0),
+      fallbackHash: f[7]!,
+      result: f[8]!,
+    };
+  }
+  return null;
+}
+
+/**
+ * Re-checks a forced draw from its log: the result is H("jumpball:forced" ‖ target hash ‖ fallback
+ * hash ‖ draw). With the feed's settings and the draw's target slot, also checks the fallback slot
+ * used is at or after the one the feed fixes (the slot hashes themselves are the chain's).
+ */
+export function checkForced(
+  f: ForcedLog,
+  feed?: { timeoutSlots: number; fallbackDelaySlots: number; drawTargetSlot: bigint },
+): { resultOk: boolean; slotsOk: boolean | null } {
+  const resultOk = createHash('sha256')
+    .update('jumpball:forced')
+    .update(f.targetHash)
+    .update(f.fallbackHash)
+    .update(f.draw.toBuffer())
+    .digest()
+    .equals(f.result);
+  const slotsOk = feed
+    ? f.targetSlot >= feed.drawTargetSlot && f.fallbackSlot >= fallbackSlot(feed.drawTargetSlot, feed.timeoutSlots, feed.fallbackDelaySlots)
+    : null;
+  return { resultOk, slotsOk };
 }
