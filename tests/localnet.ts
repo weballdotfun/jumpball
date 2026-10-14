@@ -34,7 +34,8 @@ const links = chain(10);
 const id = 1n;
 const [feed] = PublicKey.findProgramAddressSync([Buffer.from('feed'), operator.publicKey.toBuffer(), u64(id)], PROGRAM_ID);
 const DELAY = 2, TIMEOUT = 20;
-await send(ix(Buffer.concat([Buffer.from([0]), u64(id), links[0]!, u32(DELAY), u32(TIMEOUT), u64(BigInt(links.length - 1))]),
+// Feed 1 has no fallback (fallback_delay_slots 0): a withheld draw fails, as before the fallback.
+await send(ix(Buffer.concat([Buffer.from([0]), u64(id), links[0]!, u32(DELAY), u32(TIMEOUT), u64(BigInt(links.length - 1)), u32(0)]),
   [[operator.publicKey, true, true], [operator.publicKey, true, false], [feed, false, true], [SystemProgram.programId, false, false]]), operator);
 
 const drawKey = (nonce: Buffer) => PublicKey.findProgramAddressSync([Buffer.from('draw'), feed.toBuffer(), game.publicKey.toBuffer(), nonce], PROGRAM_ID)[0];
@@ -73,10 +74,13 @@ assert.equal(await c.status(), 1);
 console.log('draws 2 and 3 fulfilled in order');
 
 // 3. A draw nobody reveals in time can be expired by anyone; the late secret still advances the chain.
+// (Fallback test 5: with fallback_delay_slots 0 this is exactly today's behaviour, and force_settle
+// is refused.)
 const d = await request();
 await waitSlot(d.target + TIMEOUT);
 const stranger = Keypair.generate();
 await conn.confirmTransaction(await conn.requestAirdrop(stranger.publicKey, 1e9), 'confirmed');
+await custom(send(ix(Buffer.from([7]), [[stranger.publicKey, true, false], [feed, false, true], [d.draw, false, true], [SYSVAR_SLOT_HASHES_PUBKEY, false, false]]), stranger), 13); // FallbackDisabled
 await send(ix(Buffer.from([3]), [[feed, false, true], [d.draw, false, true]]), stranger);
 assert.equal(await d.status(), 2, 'failed');
 await reveal(d.draw, links[4]!);
@@ -188,5 +192,101 @@ console.log('crank revealed draw 5');
   assert.equal((await feedNow()).chainEnd, done.revealed + 5n);
   await req();
   console.log('chain ran out: requests stopped, waiting draws revealed, new chain committed, requests resumed');
+}
+// 8. The slot-hash fallback: a feed with fallback_delay_slots settles withheld draws from slot hashes.
+{
+  const { initFeedIx, requestIx, revealIx, expireIx, forceSettleIx, readFeed, readDraw, feedAddress, fallbackSlot, parseForcedLog, checkForced, hashChain, DrawStatus } =
+    await import('../sdk/src/index.js');
+  const FALLBACK = 8;
+  // Settings must fit the SlotHashes sysvar: 2 + 200 + 8 + 200 > 400 is refused.
+  await custom(send(initFeedIx({ program: PROGRAM_ID, payer: operator.publicKey, authority: operator.publicKey, id: 3n, head: randomBytes(32), delaySlots: 2, timeoutSlots: 200, chainLength: 5n, fallbackDelaySlots: 8 }), operator), 10);
+  const fl = hashChain(randomBytes(32), 10);
+  const feed2 = feedAddress(PROGRAM_ID, operator.publicKey, 2n);
+  await send(initFeedIx({ program: PROGRAM_ID, payer: operator.publicKey, authority: operator.publicKey, id: 2n, head: fl[0]!, delaySlots: DELAY, timeoutSlots: TIMEOUT, chainLength: 10n, fallbackDelaySlots: FALLBACK }), operator);
+  const feedNow = async () => readFeed((await conn.getAccountInfo(feed2, 'confirmed'))!.data);
+  assert.equal((await feedNow()).fallbackDelaySlots, FALLBACK);
+  const req2 = async () => {
+    const nonce = randomBytes(32);
+    await send(requestIx({ program: PROGRAM_ID, payer: game.publicKey, requester: game.publicKey, feed: feed2, nonce }), game);
+    const draw = PublicKey.findProgramAddressSync([Buffer.from('draw'), feed2.toBuffer(), game.publicKey.toBuffer(), nonce], PROGRAM_ID)[0];
+    const read = async () => readDraw((await conn.getAccountInfo(draw, 'confirmed'))!.data);
+    const t = (await read()).targetSlot;
+    return { draw, read, target: Number(t), fallback: Number(fallbackSlot(t, TIMEOUT, FALLBACK)) };
+  };
+  const reveal2 = (draw: PublicKey, secret: Buffer) => send(revealIx({ program: PROGRAM_ID, authority: operator.publicKey, feed: feed2, draw, secret }), operator);
+  const force = (draw: PublicKey) => send(forceSettleIx({ program: PROGRAM_ID, caller: stranger.publicKey, feed: feed2, draw }), stranger);
+  const expire2 = (draw: PublicKey) => send(expireIx({ program: PROGRAM_ID, feed: feed2, draw }), stranger);
+
+  // 8.1 A normal reveal still works; force_settle on a fulfilled draw is refused.
+  const a2 = await req2();
+  await waitSlot(a2.target);
+  await reveal2(a2.draw, fl[1]!);
+  assert.equal((await a2.read()).status, DrawStatus.Fulfilled);
+  await custom(force(a2.draw), 5); // NotPending
+  console.log('fallback feed: a normal reveal still fulfils; force_settle refused on it');
+
+  // 8.2 A withheld reveal: force_settle (and expire) are refused before the fallback slot; after it,
+  // anyone settles the draw, the result re-checks from the log, and feed.forced counts it.
+  const b2 = await req2();
+  await waitSlot(b2.target + TIMEOUT); // the reveal window has closed
+  await custom(force(b2.draw), 3); // TooEarly: the fallback slot hasn't passed
+  await custom(expire2(b2.draw), 6); // NotTimedOut: the fallback window comes first
+  await waitSlot(b2.fallback);
+  const sig = await force(b2.draw);
+  const forcedDraw = await b2.read();
+  assert.equal(forcedDraw.status, DrawStatus.Forced);
+  assert.ok(forcedDraw.fallbackSlot >= BigInt(b2.fallback), 'the fallback slot (or the next produced one) is recorded');
+  const tx = await conn.getTransaction(sig, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+  const log = parseForcedLog(tx!.meta!.logMessages!);
+  assert.ok(log && log.index === 2n && log.draw.equals(b2.draw), 'force_settle logged draw 2');
+  assert.deepEqual(checkForced(log!, { timeoutSlots: TIMEOUT, fallbackDelaySlots: FALLBACK, drawTargetSlot: BigInt(b2.target) }), { resultOk: true, slotsOk: true });
+  assert.ok(log!.result.equals(forcedDraw.result) && log!.fallbackSlot === forcedDraw.fallbackSlot, 'the log matches the account');
+  assert.equal(checkForced({ ...log!, result: Buffer.alloc(32) }).resultOk, false);
+  assert.equal((await feedNow()).forced, 1n, 'one forced draw, public');
+  console.log('withheld reveal: force_settle refused early, then forced; the log re-checks; forced = 1');
+
+  // 8.6 A second force_settle is refused.
+  await custom(force(b2.draw), 5); // NotPending
+
+  // 8.3 A late reveal after Forced leaves the result unchanged and advances the chain; the next draw
+  // then reveals normally.
+  await reveal2(b2.draw, fl[2]!);
+  const afterLate = await b2.read();
+  assert.equal(afterLate.status, DrawStatus.Forced);
+  assert.ok(afterLate.result.equals(forcedDraw.result), 'the late reveal changed nothing');
+  assert.equal((await feedNow()).revealed, 2n, 'the chain advanced');
+  const c2 = await req2();
+  await waitSlot(c2.target);
+  await reveal2(c2.draw, fl[3]!);
+  assert.equal((await c2.read()).status, DrawStatus.Fulfilled);
+  console.log('late reveal after Forced: result unchanged, chain advanced; the next draw revealed normally');
+
+  // A late reveal while the draw is still pending (window closed) must not fail it: it stays pending
+  // for force_settle, so a late reveal can't turn a withheld draw into a refund.
+  const e2 = await req2();
+  await waitSlot(e2.target + TIMEOUT);
+  await reveal2(e2.draw, fl[4]!);
+  assert.equal((await e2.read()).status, DrawStatus.Pending, 'still pending after a late reveal');
+  assert.equal((await feedNow()).failures, 0n);
+  await waitSlot(e2.fallback);
+  // The settler (crank/settle.ts, anyone can run it) force-settles it.
+  const { settleDue } = await import('../crank/settle.js');
+  const did = await settleDue(conn, PROGRAM_ID, feed2, stranger);
+  assert.ok(did.some((l) => l.startsWith('forced draw 4')), `settler forced draw 4 (${did.join('; ')})`);
+  assert.equal((await e2.read()).status, DrawStatus.Forced);
+  console.log('a late reveal on a pending draw leaves it for force_settle (no refund); the settler forced it');
+
+  // 8.4 The fallback window missed too: force_settle is refused and expire fails the draw (refund).
+  const d2 = await req2();
+  await waitSlot(d2.fallback + TIMEOUT);
+  await custom(force(d2.draw), 14); // FallbackClosed
+  await expire2(d2.draw);
+  assert.equal((await d2.read()).status, DrawStatus.Failed);
+  const end = await feedNow();
+  assert.equal(end.failures, 1n, 'one failure, public');
+  assert.equal(end.forced, 2n);
+  await reveal2(d2.draw, fl[5]!); // the chain still advances past it
+  assert.equal((await feedNow()).revealed, 5n);
+  console.log('fallback window missed: force_settle refused, expired (refund); failures = 1');
 }
 console.log('ALL PASSED');
