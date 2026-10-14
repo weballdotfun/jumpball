@@ -21,17 +21,24 @@ hash nobody knows in advance.
    are accepted. The draw will use the hash of a slot after `L`, which nobody can know yet.
 3. **Reveal.** The operator reveals the next secret `s_i`. Jumpball checks `H(s_i) == s_{i-1}` and
    computes the result as `H(s_i || slot_hash(L + k))`.
-4. **Timeout.** If the reveal doesn't arrive within a set number of slots, the draw is marked
-   failed, so the consuming program can refund.
+4. **Timeout and fallback.** If the reveal doesn't arrive within the reveal window, a feed with a
+   fallback (`fallback_delay_slots` > 0) settles the draw anyway: once a later **fallback slot**
+   has passed, anyone calls `force_settle`, and the result is
+   `H("jumpball:forced" || slot_hash(target) || slot_hash(fallback) || draw)`. The draw is marked
+   **Forced**, which consumers treat like a revealed draw. Without a fallback, or if nobody settles
+   it within the fallback window either, the draw is marked failed and the consuming program
+   refunds.
 
-Why nobody can steer it:
+What each party can and can't do:
 
 - **The operator** committed to its secrets before any draw and can't change them. It also can't
   know the slot hash when entries close.
 - **A validator** can influence a slot hash only by skipping its slot, and it doesn't know the
   operator's secret, so it can't tell which slot hash would help.
 - **Someone holding the secrets** still doesn't know the slot hash while entries are open.
-- **Withholding a reveal** only fails the draw (refund). It can't pick an outcome.
+- **Withholding a reveal** can't pick an outcome either: on a feed with a fallback it re-rolls the
+  draw once from slot hashes nobody knows yet (see "Known limitation"), and without one it fails the
+  draw (refund).
 
 ## Checking a draw
 
@@ -40,6 +47,14 @@ Every fulfilled reveal logs its inputs and result (`Program data: jumpball revea
 after its account is closed. The SDK's `parseRevealLog` reads it and `checkReveal` confirms that the
 secret hashes to the link committed before it and that the result is
 `H("jumpball" ‖ secret ‖ slot hash ‖ draw)`.
+
+A forced draw logs its inputs the same way (`Program data: jumpball forced <draw> <index> <target
+slot> <target hash> <fallback slot> <fallback hash> <result>`, the slots being the produced slots
+used). `parseForcedLog` reads it and `checkForced` confirms the result is
+`H("jumpball:forced" ‖ target hash ‖ fallback hash ‖ draw)` and, given the feed's settings, that the
+fallback slot is at or after `target + timeout_slots + fallback_delay_slots`. The slot hashes
+themselves are the chain's, as for a reveal. The distinct domain tag means a forced result can never
+equal a revealed one.
 
 ## When a chain runs out
 
@@ -59,38 +74,55 @@ than it agreed to. New feeds are free. Every fee paid logs `Program data: jumpba
 
 ## Known limitation (and how it's handled)
 
-Whoever holds the secrets can compute a draw's result once its slot hash is known, before
-revealing it, and could choose **not** to reveal. That can't pick an outcome: the draw simply fails
-and the consuming program refunds. But a dishonest operator colluding with a player could use
-failures as a free "undo" on rounds that player lost. Mitigations:
+Whoever holds the secrets can compute a draw's result once its slot hash is known, before revealing
+it, and could choose **not** to reveal. **A missed reveal can re-roll a draw once, and every one is
+publicly counted.**
 
-- Reveals are sent automatically by a crank as soon as the slot hash exists, with no human in the
-  loop.
-- Every failed draw is counted on chain in the feed (`failures`) and is public; a rising count is a
-  red flag anyone can see.
-- Consuming programs should cap what one player can put into a single draw.
+- Withholding a reveal gives the operator a choice between the known revealed result R and an
+  unknown fallback result F: one re-roll per draw. It cannot pick F. The fallback slot comes
+  `fallback_delay_slots` after the reveal window closes, so its hash doesn't exist when the operator
+  decides not to reveal. Every forced draw is public (`forced` in the feed). Consumers should keep
+  the value decided by any single draw small (caps) and publish the forced count.
+- `force_settle` is permissionless and one honest caller suffices: the result is fixed by the slot
+  hashes, whoever calls it. Reaching a refund instead needs everyone to abstain for the whole
+  fallback window, and those are counted in `failures`.
+- A forced draw relies only on slot hashes. A skipped fallback slot rolls on to the next produced
+  slot, as target slots do; validators keep the influence over slot hashes they have today (skipping
+  their slot), and with no secret in a forced result, that influence is not hidden behind one.
+- On a feed without a fallback (`fallback_delay_slots` = 0) a missed reveal fails the draw and the
+  consuming program refunds; a dishonest operator colluding with a player could use those refunds
+  as an "undo" on lost rounds. Prefer a fallback.
+
+Reveals are sent automatically by a crank as soon as the slot hash exists, with no human in the
+loop, and anyone can run the settler (`crank/settle.ts`).
 
 ## Program
 
 | # | Instruction | What it does |
 |---|---|---|
-| 0 | `init_feed` | An operator commits a hash chain (`head = s_0`) and its length, with the slot delay and reveal window. |
+| 0 | `init_feed` | An operator commits a hash chain (`head = s_0`) and its length, with the slot delay, reveal window and fallback delay (0 = none). |
 | 1 | `request` | A consumer locks a draw at the current slot; it is assigned the feed's next secret. |
 | 2 | `reveal` | The operator reveals that secret; the result is `H("jumpball" ‖ secret ‖ slot hash ‖ draw)`. |
-| 3 | `expire` | Anyone fails a draw whose reveal window closed (the consumer refunds). |
+| 3 | `expire` | Anyone fails a draw whose reveal window closed, and with a fallback, whose fallback window closed too (the consumer refunds). |
 | 4 | `close_draw` | The requester closes a settled draw and its payer gets the rent back. |
 | 5 | `recommit` | The operator commits a new chain (and its length) once every assigned secret is revealed. |
 | 6 | `set_fee` | The operator sets the per-request fee: SOL to a wallet, or a token with part burned. |
+| 7 | `force_settle` | Anyone settles a withheld draw from slot hashes once the fallback slot has passed (status Forced). |
 
-The target slot is `lock + delay_slots`; if that slot was skipped, the first produced slot after it
-is used. The reveal window must fit in the 512 slots the SlotHashes sysvar keeps.
+The target slot is `lock + delay_slots`; the fallback slot is `target + timeout_slots +
+fallback_delay_slots`, and `force_settle` stays open for `timeout_slots` after it. If either slot
+was skipped, the first produced slot after it is used. A late reveal never changes a forced or
+failed draw (and on a feed with a fallback it doesn't fail a pending one); it only advances the
+chain, which must keep moving in order. A feed's settings (`delay + timeout`, plus `fallback delay +
+timeout` with a fallback) are capped at 400 slots, inside the 512 the SlotHashes sysvar keeps.
 
 ## Layout
 
 ```
 programs/jumpball   the on-chain program (Rust, no framework)
 sdk/                TypeScript client: addresses, instructions, account readers, hash chain
-crank/              reference crank: reveals a feed's draws in order, automatically
+crank/              reference cranks: reveal.ts reveals a feed's draws in order (operator);
+                    settle.ts force-settles withheld draws (anyone)
 tests/              end-to-end test on a local validator
 ```
 
