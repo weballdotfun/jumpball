@@ -5,7 +5,8 @@
   "license": "Apache-2.0",
   "scripts": {
     "test:localnet": "tsx tests/localnet.ts",
-    "crank": "tsx crank/reveal.ts"
+    "crank": "tsx crank/reveal.ts",
+    "settle": "tsx crank/settle.ts"
   },
   "devDependencies": {
     "tsx": "4.19.2"
