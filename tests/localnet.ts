@@ -31,11 +31,13 @@ await conn.confirmTransaction(await conn.requestAirdrop(operator.publicKey, 10e9
 await conn.confirmTransaction(await conn.requestAirdrop(game.publicKey, 10e9), 'confirmed');
 
 const links = chain(10);
+// Commits later chains: never the operator (the internal review, 14 Oct 2026: the founder's hardware wallet).
+const committer = Keypair.generate();
 const id = 1n;
 const [feed] = PublicKey.findProgramAddressSync([Buffer.from('feed'), operator.publicKey.toBuffer(), u64(id)], PROGRAM_ID);
 const DELAY = 2, TIMEOUT = 20;
 // Feed 1 has no fallback (fallback_delay_slots 0): a withheld draw fails, as before the fallback.
-await send(ix(Buffer.concat([Buffer.from([0]), u64(id), links[0]!, u32(DELAY), u32(TIMEOUT), u64(BigInt(links.length - 1)), u32(0)]),
+await send(ix(Buffer.concat([Buffer.from([0]), u64(id), links[0]!, u32(DELAY), u32(TIMEOUT), u64(BigInt(links.length - 1)), u32(0), committer.publicKey.toBuffer(), Buffer.alloc(32)]),
   [[operator.publicKey, true, true], [operator.publicKey, true, false], [feed, false, true], [SystemProgram.programId, false, false]]), operator);
 
 const drawKey = (nonce: Buffer) => PublicKey.findProgramAddressSync([Buffer.from('draw'), feed.toBuffer(), game.publicKey.toBuffer(), nonce], PROGRAM_ID)[0];
@@ -83,6 +85,9 @@ await conn.confirmTransaction(await conn.requestAirdrop(stranger.publicKey, 1e9)
 await custom(send(ix(Buffer.from([7]), [[stranger.publicKey, true, false], [feed, false, true], [d.draw, false, true], [SYSVAR_SLOT_HASHES_PUBKEY, false, false]]), stranger), 13); // FallbackDisabled
 await send(ix(Buffer.from([3]), [[feed, false, true], [d.draw, false, true]]), stranger);
 assert.equal(await d.status(), 2, 'failed');
+// The internal review (14 Oct 2026): a failed draw can't be closed before its secret is revealed, or the
+// chain would lose the account its next reveal needs.
+await custom(send(ix(Buffer.from([4]), [[game.publicKey, true, false], [d.draw, false, true], [game.publicKey, false, true], [feed, false, false]]), game), 15); // NotRevealedYet
 await reveal(d.draw, links[4]!);
 const f = (await conn.getAccountInfo(feed))!.data;
 assert.equal(f.readBigUInt64LE(96), 4n, 'four secrets revealed');
@@ -91,7 +96,7 @@ console.log('draw 4 expired (refund), chain advanced; failures = 1');
 
 // 4. The requester closes a settled draw and gets its rent back.
 const before = await conn.getBalance(game.publicKey);
-await send(ix(Buffer.from([4]), [[game.publicKey, true, false], [a.draw, false, true], [game.publicKey, false, true]]), game);
+await send(ix(Buffer.from([4]), [[game.publicKey, true, false], [a.draw, false, true], [game.publicKey, false, true], [feed, false, false]]), game);
 assert.equal(await conn.getAccountInfo(a.draw), null);
 assert.ok((await conn.getBalance(game.publicKey)) > before - 10_000, 'rent returned (less the fee)');
 console.log('draw 1 closed, rent back');
@@ -140,7 +145,8 @@ console.log('crank revealed draw 5');
   await custom(req(), 11); // no maximum given
   await custom(req({ maxFee: 999_999n, fee: { kind: 'sol', wallet } }), 11); // agreed to less than the fee
   await custom(req({ maxFee: 1_000_000n, fee: { kind: 'sol', wallet: Keypair.generate().publicKey } }), 7); // wrong wallet
-  await req({ maxFee: 1_000_000n, fee: { kind: 'sol', wallet } });
+  await custom(req({ maxFee: 1_000_000n, fee: { kind: 'sol', wallet }, feeKind: 'token' }), 17); // FeeKindChanged
+  await req({ maxFee: 1_000_000n, fee: { kind: 'sol', wallet }, feeKind: 'sol' });
   assert.equal(await conn.getBalance(wallet, 'confirmed'), 1_000_000);
   console.log('SOL fee paid to the fee wallet');
 
@@ -174,24 +180,33 @@ console.log('crank revealed draw 5');
 // 7. The chain runs out: requests stop at its end (never a draw without a secret), the waiting draws
 // are revealed, then a new chain is committed and requests resume.
 {
-  const { requestIx, recommitIx, readFeed, hashChain } = await import('../sdk/src/index.js');
+  const { requestIx, commitNextIx, readFeed, hashChain } = await import('../sdk/src/index.js');
   const feedNow = async () => readFeed((await conn.getAccountInfo(feed, 'confirmed'))!.data);
   const req = () => send(requestIx({ program: PROGRAM_ID, payer: game.publicKey, requester: game.publicKey, feed, nonce: randomBytes(32) }), game);
   while ((await feedNow()).assigned < (await feedNow()).chainEnd) await req();
   await custom(req(), 12); // ChainExhausted
+  // The next chain is committed ahead, while draws are still waiting (no idle moment needed), and only
+  // by the commit authority.
   const fresh = hashChain(randomBytes(32), 5);
-  await custom(send(recommitIx({ program: PROGRAM_ID, authority: operator.publicKey, feed, head: fresh[0]!, chainLength: 5n }), operator), 9); // draws still waiting
+  await conn.confirmTransaction(await conn.requestAirdrop(committer.publicKey, 1e9), 'confirmed');
+  const commit = (signer: Keypair, chainLength: bigint) =>
+    send(commitNextIx({ program: PROGRAM_ID, commitAuthority: signer.publicKey, feed, head: fresh[0]!, chainLength }), signer);
+  await custom(commit(operator, 5n), 8); // Unauthorized: the operator can't commit chains
+  await custom(commit(committer, 0n), 10);
+  const before = await feedNow();
+  assert.ok(before.revealed < before.assigned, 'draws are waiting');
+  await commit(committer, 5n);
+  await custom(commit(committer, 5n), 16); // NextChainPending: can't be replaced
+  await req(); // requests resume at once, into the next chain
   for (let i = 0; i < 400 && (await feedNow()).revealed < (await feedNow()).assigned; i++) {
-    const r = await revealNext(conn, PROGRAM_ID, operator, id, links);
+    const r = await revealNext(conn, PROGRAM_ID, operator, id, links, fresh);
     if (typeof r !== 'object') await new Promise((res) => setTimeout(res, 300));
   }
   const done = await feedNow();
-  assert.equal(done.revealed, done.assigned, 'every waiting draw revealed or failed');
-  await custom(send(recommitIx({ program: PROGRAM_ID, authority: operator.publicKey, feed, head: fresh[0]!, chainLength: 0n }), operator), 10);
-  await send(recommitIx({ program: PROGRAM_ID, authority: operator.publicKey, feed, head: fresh[0]!, chainLength: 5n }), operator);
-  assert.equal((await feedNow()).chainEnd, done.revealed + 5n);
-  await req();
-  console.log('chain ran out: requests stopped, waiting draws revealed, new chain committed, requests resumed');
+  assert.equal(done.revealed, done.assigned, 'every waiting draw revealed or failed, across the switch');
+  assert.equal(done.chainEnd, before.chainEnd + 5n, 'the next chain took over');
+  assert.equal(done.next.length, 0n);
+  console.log('chain ran out: next chain committed ahead by the commit authority, requests resumed, reveals crossed the switch');
 }
 // 8. The slot-hash fallback: a feed with fallback_delay_slots settles withheld draws from slot hashes.
 {
@@ -199,10 +214,20 @@ console.log('crank revealed draw 5');
     await import('../sdk/src/index.js');
   const FALLBACK = 8;
   // Settings must fit the SlotHashes sysvar: 2 + 200 + 8 + 200 > 400 is refused.
-  await custom(send(initFeedIx({ program: PROGRAM_ID, payer: operator.publicKey, authority: operator.publicKey, id: 3n, head: randomBytes(32), delaySlots: 2, timeoutSlots: 200, chainLength: 5n, fallbackDelaySlots: 8 }), operator), 10);
+  const init = (o: { id: bigint; head?: Buffer; delay?: number; timeout?: number; fallback?: number; commit?: PublicKey; allowed?: PublicKey }) =>
+    send(initFeedIx({ program: PROGRAM_ID, payer: operator.publicKey, authority: operator.publicKey, id: o.id, head: o.head ?? randomBytes(32), delaySlots: o.delay ?? 2, timeoutSlots: o.timeout ?? TIMEOUT, chainLength: 10n, fallbackDelaySlots: o.fallback ?? 8, commitAuthority: o.commit ?? committer.publicKey, allowedRequester: o.allowed }), operator);
+  await custom(init({ id: 3n, timeout: 200 }), 10); // 2 + 200 + 8 + 200 > 400
+  await custom(init({ id: 3n, fallback: 5 }), 10); // a fallback under 8 slots (two leader windows)
+  await custom(init({ id: 3n, commit: operator.publicKey }), 10); // the operator can't be the commit authority
+  // A feed for one requester (the internal review: a free feed others can't flood).
+  await init({ id: 4n, allowed: game.publicKey });
+  const feed4 = feedAddress(PROGRAM_ID, operator.publicKey, 4n);
+  await custom(send(requestIx({ program: PROGRAM_ID, payer: stranger.publicKey, requester: stranger.publicKey, feed: feed4, nonce: randomBytes(32) }), stranger), 8);
+  await send(requestIx({ program: PROGRAM_ID, payer: game.publicKey, requester: game.publicKey, feed: feed4, nonce: randomBytes(32) }), game);
+  console.log('settings refused (window, fallback < 8, operator as commit authority); a one-requester feed refuses others');
   const fl = hashChain(randomBytes(32), 10);
   const feed2 = feedAddress(PROGRAM_ID, operator.publicKey, 2n);
-  await send(initFeedIx({ program: PROGRAM_ID, payer: operator.publicKey, authority: operator.publicKey, id: 2n, head: fl[0]!, delaySlots: DELAY, timeoutSlots: TIMEOUT, chainLength: 10n, fallbackDelaySlots: FALLBACK }), operator);
+  await init({ id: 2n, head: fl[0]!, delay: DELAY, fallback: FALLBACK });
   const feedNow = async () => readFeed((await conn.getAccountInfo(feed2, 'confirmed'))!.data);
   assert.equal((await feedNow()).fallbackDelaySlots, FALLBACK);
   const req2 = async () => {
@@ -247,6 +272,10 @@ console.log('crank revealed draw 5');
 
   // 8.6 A second force_settle is refused.
   await custom(force(b2.draw), 5); // NotPending
+  // The review's critical case: a forced draw closed before its secret is revealed would leave the chain
+  // stuck for good. Refused until the reveal.
+  const { closeDrawIx } = await import('../sdk/src/index.js');
+  await custom(send(closeDrawIx({ program: PROGRAM_ID, requester: game.publicKey, draw: b2.draw, payer: game.publicKey, feed: feed2 }), game), 15);
 
   // 8.3 A late reveal after Forced leaves the result unchanged and advances the chain; the next draw
   // then reveals normally.
@@ -255,6 +284,7 @@ console.log('crank revealed draw 5');
   assert.equal(afterLate.status, DrawStatus.Forced);
   assert.ok(afterLate.result.equals(forcedDraw.result), 'the late reveal changed nothing');
   assert.equal((await feedNow()).revealed, 2n, 'the chain advanced');
+  await send(closeDrawIx({ program: PROGRAM_ID, requester: game.publicKey, draw: b2.draw, payer: game.publicKey, feed: feed2 }), game); // now it may
   const c2 = await req2();
   await waitSlot(c2.target);
   await reveal2(c2.draw, fl[3]!);

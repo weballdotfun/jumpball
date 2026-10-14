@@ -36,6 +36,8 @@ export async function revealNext(
   authority: Keypair,
   feedId: bigint,
   links: Buffer[],
+  /** The next chain's links, once it's committed (`commitNextIx`): secrets past the current chain's end. */
+  nextLinks?: Buffer[],
 ): Promise<'none' | 'waiting' | { revealed: bigint; status: DrawStatus; signature: string }> {
   const feedKey = feedAddress(program, authority.publicKey, feedId);
   const info = await conn.getAccountInfo(feedKey, 'confirmed');
@@ -50,7 +52,8 @@ export async function revealNext(
   // `links` is the current chain (links[0] its committed head): it covers the secrets up to
   // chainEnd, so the i-th secret of this chain is index - (chainEnd - length).
   const start = feed.chainEnd - BigInt(links.length - 1);
-  const secret = index > start ? links[Number(index - start)] : undefined;
+  // Past this chain's end the next chain (committed ahead) takes over: its i-th secret is chainEnd + i.
+  const secret = index > feed.chainEnd ? nextLinks?.[Number(index - feed.chainEnd)] : index > start ? links[Number(index - start)] : undefined;
   if (!secret) throw new Error(`the chain has no secret ${index}: is this the feed's current chain?`);
   const signature = await sendAndConfirmTransaction(
     conn,
