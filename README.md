@@ -58,10 +58,24 @@ equal a revealed one.
 
 ## When a chain runs out
 
-A feed knows how many secrets its committed chain holds (`chain_end`). Requests stop there
-(`ChainExhausted`), so a draw is never assigned a secret that doesn't exist; the operator reveals
-the waiting draws and commits a new chain, and requests resume. A new chain can't be committed while
-draws are waiting, so the operator can't pick a chain after seeing a draw's slot hash.
+A feed knows how many secrets its committed chain holds (`chain_end`). The feed's **commit authority**,
+a key apart from the operator (ours is on a hardware wallet), commits the next chain ahead of time
+with `commit_next`: requests may then run on into it, and the first reveal past `chain_end` switches
+to it. A committed next chain can't be replaced (draws may already be assigned to it), and the
+operator can't commit chains at all, so a stolen operator key can't commit a chain nobody can reveal.
+Without a next chain, requests stop at `chain_end` (`ChainExhausted`); a draw is never assigned a
+secret that doesn't exist.
+
+## Closing draws
+
+The requester closes a settled draw to get its rent back, but only once its secret has been revealed.
+Reveals go in order and each needs its draw's account, so closing a forced or failed draw before its
+reveal would stop the chain for good.
+
+## Who may request
+
+Anyone, unless the feed names an `allowed_requester` at creation: then only that key (for example a
+game's own fixed PDA). A free feed for one consumer can't be flooded by others to delay its draws.
 
 ## Fees
 
@@ -86,9 +100,12 @@ publicly counted.**
 - `force_settle` is permissionless and one honest caller suffices: the result is fixed by the slot
   hashes, whoever calls it. Reaching a refund instead needs everyone to abstain for the whole
   fallback window, and those are counted in `failures`.
-- A forced draw relies only on slot hashes. A skipped fallback slot rolls on to the next produced
-  slot, as target slots do; validators keep the influence over slot hashes they have today (skipping
-  their slot), and with no secret in a forced result, that influence is not hidden behind one.
+- A forced draw relies only on slot hashes, with no secret in it. The leader producing the fallback slot
+  can vary its block to try many slot hashes and pick a result it likes before publishing: real control,
+  not just skipping. That is why the fallback delay is at least 8 slots (two leader windows), so the
+  fallback slot is never produced by the leader of the reveal window's last slot; it also means every
+  forced draw is a weaker draw. A skipped fallback slot rolls on to the next produced slot, as target
+  slots do. Treat a rising `forced` count as an incident.
 - On a feed without a fallback (`fallback_delay_slots` = 0) a missed reveal fails the draw and the
   consuming program refunds; a dishonest operator colluding with a player could use those refunds
   as an "undo" on lost rounds. Prefer a fallback.
@@ -96,16 +113,31 @@ publicly counted.**
 Reveals are sent automatically by a crank as soon as the slot hash exists, with no human in the
 loop, and anyone can run the settler (`crank/settle.ts`).
 
+### Trust assumptions, stated plainly
+
+- **Operator and validator together:** an operator colluding with the leader of a draw's target slot
+  can choose that draw's result (the leader knows the secret and can vary the slot hash). Each alone
+  can't.
+- **The seed:** whoever holds an operator's chain seed knows each draw's result as soon as its target
+  slot exists. That is safe only if the consumer allows no action between locking a draw and settling
+  it (Shot Clock allows none).
+- **No key rotation:** a feed's operator and commit authority can't be changed; losing the operator key
+  means moving to a new feed.
+- **Fee mints:** a token fee works with plain SPL Token and Token-2022 mints. Token-2022 extensions such
+  as transfer hooks, required memos, pausing, non-transferability or CPI guard make requests fail, and a
+  transfer fee means the fee account receives less than the logged amount. Check a mint's extensions
+  before setting it as a fee.
+
 ## Program
 
 | # | Instruction | What it does |
 |---|---|---|
-| 0 | `init_feed` | An operator commits a hash chain (`head = s_0`) and its length, with the slot delay, reveal window and fallback delay (0 = none). |
-| 1 | `request` | A consumer locks a draw at the current slot; it is assigned the feed's next secret. |
+| 0 | `init_feed` | An operator commits a hash chain (`head = s_0`) and its length, with the slot delay, reveal window, fallback delay (0 = none, else at least 8), commit authority and allowed requester (none = anyone). |
+| 1 | `request` | A consumer locks a draw at the current slot; it is assigned the feed's next secret. It may name the most it will pay and the fee's kind. |
 | 2 | `reveal` | The operator reveals that secret; the result is `H("jumpball" ‖ secret ‖ slot hash ‖ draw)`. |
 | 3 | `expire` | Anyone fails a draw whose reveal window closed, and with a fallback, whose fallback window closed too (the consumer refunds). |
-| 4 | `close_draw` | The requester closes a settled draw and its payer gets the rent back. |
-| 5 | `recommit` | The operator commits a new chain (and its length) once every assigned secret is revealed. |
+| 4 | `close_draw` | The requester closes a settled draw once its secret is revealed; its payer gets the rent back. |
+| 5 | `commit_next` | The commit authority commits the next chain ahead of time; it takes over past the current one's end. |
 | 6 | `set_fee` | The operator sets the per-request fee: SOL to a wallet, or a token with part burned. |
 | 7 | `force_settle` | Anyone settles a withheld draw from slot hashes once the fallback slot has passed (status Forced). |
 

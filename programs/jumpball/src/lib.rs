@@ -10,18 +10,18 @@
 //!
 //! Instructions (first byte):
 //! 0 `init_feed`  id u64 · head [32] · delay_slots u32 · timeout_slots u32 · chain_length u64 ·
-//!   fallback_delay_slots u32
+//!   fallback_delay_slots u32 · commit_authority [32] · allowed_requester [32] (zero = anyone)
 //!   accounts: payer (signer, writable) · authority (signer) · feed (writable) · system program
-//! 1 `request`    nonce [32]
+//! 1 `request`    nonce [32] · max_fee u64 (optional) · fee_kind u8 (optional)
 //!   accounts: payer (signer, writable) · requester (signer) · feed (writable) · draw (writable) · system program
 //! 2 `reveal`     secret [32]
 //!   accounts: authority (signer) · feed (writable) · draw (writable) · SlotHashes sysvar
 //! 3 `expire`     (none)
 //!   accounts: feed (writable) · draw (writable)
-//! 4 `close_draw` (none)
-//!   accounts: requester (signer) · draw (writable) · payer (writable, the draw's payer)
-//! 5 `recommit`   head [32] · chain_length u64
-//!   accounts: authority (signer) · feed (writable)
+//! 4 `close_draw` (none): only once the draw's secret has been revealed
+//!   accounts: requester (signer) · draw (writable) · payer (writable, the draw's payer) · feed
+//! 5 `commit_next` head [32] · chain_length u64: the next chain, ahead of time
+//!   accounts: commit_authority (signer) · feed (writable)
 //! 6 `set_fee`    kind u8 · amount u64 · burn_bps u16 · fee_account [32]
 //!   accounts: authority (signer) · feed (writable)
 //! 7 `force_settle` (none)
@@ -78,7 +78,8 @@ pub enum JumpballError {
     WrongAccount = 7,
     /// The signer isn't the feed's authority, or the draw's requester.
     Unauthorized = 8,
-    /// Draws are still waiting for their secrets: a new chain can't be committed yet.
+    /// Draws were still waiting for their secrets (the old `recommit`; kept so codes stay stable).
+    #[allow(dead_code)]
     DrawsPending = 9,
     /// A setting is out of range.
     BadSetting = 10,
@@ -90,7 +91,18 @@ pub enum JumpballError {
     FallbackDisabled = 13,
     /// The fallback window has closed: the draw can only be expired (refund).
     FallbackClosed = 14,
+    /// The draw's secret hasn't been revealed yet: closing it would leave the chain without the account
+    /// its reveal needs (the internal review, 14 Oct 2026).
+    NotRevealedYet = 15,
+    /// A next chain is already committed (it can't be replaced: draws may already be assigned to it).
+    NextChainPending = 16,
+    /// The request expected another kind of fee than the feed charges.
+    FeeKindChanged = 17,
 }
+
+/// The least fallback delay a feed may set: two leader windows (4 slots each), so the fallback slot
+/// is never produced by the leader of the reveal window's last slot (the internal review, 14 Oct 2026).
+pub const MIN_FALLBACK_DELAY_SLOTS: u32 = 8;
 
 /// The two token programs a token fee may use (the same TransferChecked and BurnChecked layouts).
 const SPL_TOKEN: Pubkey = Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
@@ -116,7 +128,7 @@ pub fn process_instruction(
         2 => reveal(program_id, accounts, data),
         3 => expire(program_id, accounts),
         4 => close_draw(program_id, accounts),
-        5 => recommit(program_id, accounts, data),
+        5 => commit_next(program_id, accounts, data),
         6 => set_fee(program_id, accounts, data),
         7 => force_settle(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
@@ -180,7 +192,14 @@ fn init_feed(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
     let chain_length = u64_at(data, 48)?;
     // Slots after the reveal window before the fallback slot (0 = no fallback).
     let fallback_delay_slots = u32_at(data, 56)?;
-    if chain_length == 0 {
+    // Who commits later chains (never the operator), and the only requester served (zero = anyone).
+    let commit_authority = Pubkey::new_from_array(arr32(data, 60)?);
+    let allowed_requester = Pubkey::new_from_array(arr32(data, 92)?);
+    if chain_length == 0
+        || commit_authority == Pubkey::default()
+        || commit_authority == *authority.key
+        || (fallback_delay_slots != 0 && fallback_delay_slots < MIN_FALLBACK_DELAY_SLOTS)
+    {
         return Err(JumpballError::BadSetting.into());
     }
     // At least one slot of delay (the lock slot's own hash is known to its leader), and a reveal
@@ -225,6 +244,10 @@ fn init_feed(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
         chain_end: chain_length,
         fallback_delay_slots,
         forced: 0,
+        commit_authority,
+        next_head: [0; 32],
+        next_length: 0,
+        allowed_requester,
     }
     .write(&mut feed_acc.try_borrow_mut_data()?)?;
     msg!("jumpball: feed {} committed", id);
@@ -253,12 +276,25 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progra
         0
     };
     let mut feed = load_feed(program_id, feed_acc)?;
+    if feed.allowed_requester != Pubkey::default() && feed.allowed_requester != *requester.key {
+        return Err(JumpballError::Unauthorized.into());
+    }
     if feed.fee_amount > max_fee {
         return Err(JumpballError::FeeTooHigh.into());
     }
-    // Never assign a secret past the chain: otherwise the feed could only be unstuck by a new chain,
-    // which can't be committed while draws are waiting.
-    if feed.assigned >= feed.chain_end {
+    // The fee's kind, when the request names it: a kind switched after it was built can't charge it
+    // in another unit.
+    if let Some(kind) = data.get(40) {
+        if *kind != feed.fee_kind as u8 {
+            return Err(JumpballError::FeeKindChanged.into());
+        }
+    }
+    // Never assign a secret past the committed chains (this one, and the next if it's committed).
+    let capacity = feed
+        .chain_end
+        .checked_add(feed.next_length)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    if feed.assigned >= capacity {
         return Err(JumpballError::ChainExhausted.into());
     }
     let (key, bump) = Pubkey::find_program_address(
@@ -486,6 +522,17 @@ fn reveal(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
         return Err(JumpballError::Unauthorized.into());
     }
     let mut draw = load_draw(program_id, draw_acc, feed_acc.key)?;
+    // Past the end of this chain, the next (committed ahead) takes over: its first secret hashes to
+    // its head.
+    if feed.revealed == feed.chain_end && feed.next_length > 0 {
+        feed.head = feed.next_head;
+        feed.chain_end = feed
+            .chain_end
+            .checked_add(feed.next_length)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        feed.next_head = [0; 32];
+        feed.next_length = 0;
+    }
     if draw.secret_index != feed.revealed + 1 {
         return Err(JumpballError::OutOfOrder.into());
     }
@@ -658,13 +705,18 @@ fn close_draw(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let requester = next_account_info(it)?;
     let draw_acc = next_account_info(it)?;
     let payer = next_account_info(it)?;
+    let feed_acc = next_account_info(it)?;
     if !requester.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    if draw_acc.owner != program_id {
-        return Err(JumpballError::WrongAccount.into());
+    let feed = load_feed(program_id, feed_acc)?;
+    let draw = load_draw(program_id, draw_acc, feed_acc.key)?;
+    // Only once its secret is revealed (the internal review, 14 Oct 2026): reveals go in order and each
+    // needs its draw's account, so closing a forced or failed draw before then would stop the chain for
+    // good.
+    if draw.secret_index > feed.revealed {
+        return Err(JumpballError::NotRevealedYet.into());
     }
-    let draw = Draw::read(&draw_acc.try_borrow_data()?)?;
     if draw.requester != *requester.key {
         return Err(JumpballError::Unauthorized.into());
     }
@@ -686,35 +738,35 @@ fn close_draw(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     Ok(())
 }
 
-/// A new chain once every assigned secret has been revealed (a chain is finite).
-fn recommit(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+/// The commit authority (not the operator: the founder's hardware wallet, 14 Oct 2026) commits the next
+/// chain ahead of time. It takes over at the first reveal past `chain_end`, so draws never wait for an
+/// idle feed. It can't be replaced once committed: draws may already be assigned to its secrets.
+fn commit_next(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let it = &mut accounts.iter();
-    let authority = next_account_info(it)?;
+    let commit_authority = next_account_info(it)?;
     let feed_acc = next_account_info(it)?;
-    if !authority.is_signer {
+    if !commit_authority.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
     let mut feed = load_feed(program_id, feed_acc)?;
-    if feed.authority != *authority.key {
+    if feed.commit_authority != *commit_authority.key {
         return Err(JumpballError::Unauthorized.into());
     }
-    if feed.revealed != feed.assigned {
-        return Err(JumpballError::DrawsPending.into());
+    if feed.next_length > 0 {
+        return Err(JumpballError::NextChainPending.into());
     }
     let chain_length = u64_at(data, 32)?;
     if chain_length == 0 {
         return Err(JumpballError::BadSetting.into());
     }
-    feed.head = arr32(data, 0)?;
-    feed.chain_end = feed
-        .revealed
-        .checked_add(chain_length)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
+    feed.next_head = arr32(data, 0)?;
+    feed.next_length = chain_length;
     feed.write(&mut feed_acc.try_borrow_mut_data()?)?;
     msg!(
-        "jumpball: feed {} recommitted at draw {}",
+        "jumpball: feed {} next chain committed ({} secrets after {})",
         feed.id,
-        feed.revealed
+        chain_length,
+        feed.chain_end
     );
     Ok(())
 }

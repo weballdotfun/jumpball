@@ -10,14 +10,16 @@ use solana_program::{program_error::ProgramError, pubkey::Pubkey};
 pub const FEED_SEED: &[u8] = b"feed";
 pub const DRAW_SEED: &[u8] = b"draw";
 
-const FEED_TAG: [u8; 8] = *b"JBFEED02";
+const FEED_TAG: [u8; 8] = *b"JBFEED03";
 const DRAW_TAG: [u8; 8] = *b"JBDRAW01";
 
 /// 0 tag [8] · 8 bump u8 · 9 pad [7] · 16 authority [32] · 48 head [32] · 80 id u64 ·
 /// 88 assigned u64 · 96 revealed u64 · 104 failures u64 · 112 delay_slots u32 · 116 timeout_slots u32 ·
 /// 120 fee_account [32] · 152 fee_amount u64 · 160 burn_bps u16 · 162 fee_kind u8 · 163 pad [5] ·
-/// 168 chain_end u64 · 176 fallback_delay_slots u32 · 180 pad [4] · 184 forced u64 · 192 reserved [8].
-pub const FEED_LEN: usize = 200;
+/// 168 chain_end u64 · 176 fallback_delay_slots u32 · 180 pad [4] · 184 forced u64 ·
+/// 192 commit_authority [32] · 224 next_head [32] · 256 next_length u64 · 264 allowed_requester [32] ·
+/// 296 reserved [8].
+pub const FEED_LEN: usize = 304;
 
 /// What a feed's fee is paid in: SOL to a wallet, or a token (the mint of `fee_account`), part of
 /// which may be burned.
@@ -58,7 +60,7 @@ impl DrawStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Feed {
     pub bump: u8,
-    /// Who reveals secrets and can recommit a new chain.
+    /// Who reveals secrets (the operator). Later chains are committed by `commit_authority`.
     pub authority: Pubkey,
     /// The last revealed secret, or the chain's committed end before any reveal.
     pub head: [u8; 32],
@@ -87,6 +89,16 @@ pub struct Feed {
     pub fallback_delay_slots: u32,
     /// Draws settled by the fallback instead of a reveal (public: each one is a missed reveal).
     pub forced: u64,
+    /// Who may commit the next chain (`commit_next`): a key apart from the operator (the founder's
+    /// hardware wallet), so a stolen operator key can't commit a chain nobody can reveal.
+    pub commit_authority: Pubkey,
+    /// The next chain, committed ahead (0 length = none): requests may run into it, and the first
+    /// reveal past `chain_end` switches to it. So the operator never needs an idle moment.
+    pub next_head: [u8; 32],
+    pub next_length: u64,
+    /// The only requester this feed serves (default = anyone): a free feed for one consumer can't be
+    /// flooded by others.
+    pub allowed_requester: Pubkey,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,6 +156,10 @@ impl Feed {
         out[168..176].copy_from_slice(&self.chain_end.to_le_bytes());
         out[176..180].copy_from_slice(&self.fallback_delay_slots.to_le_bytes());
         out[184..192].copy_from_slice(&self.forced.to_le_bytes());
+        out[192..224].copy_from_slice(self.commit_authority.as_ref());
+        out[224..256].copy_from_slice(&self.next_head);
+        out[256..264].copy_from_slice(&self.next_length.to_le_bytes());
+        out[264..296].copy_from_slice(self.allowed_requester.as_ref());
         Ok(())
     }
 
@@ -172,6 +188,10 @@ impl Feed {
             chain_end: u64_at(d, 168),
             fallback_delay_slots: u32_at(d, 176),
             forced: u64_at(d, 184),
+            commit_authority: key_at(d, 192),
+            next_head: b32_at(d, 224),
+            next_length: u64_at(d, 256),
+            allowed_requester: key_at(d, 264),
         })
     }
 }
@@ -240,6 +260,10 @@ mod tests {
             chain_end: 1_000,
             fallback_delay_slots: 8,
             forced: 2,
+            commit_authority: Pubkey::new_unique(),
+            next_head: [3; 32],
+            next_length: 500,
+            allowed_requester: Pubkey::new_unique(),
         };
         let mut buf = vec![0u8; FEED_LEN];
         f.write(&mut buf).unwrap();

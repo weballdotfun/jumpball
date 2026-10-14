@@ -30,12 +30,18 @@ export interface Feed {
   /** Per request: 0 = free. SOL goes to `feeAccount` (a wallet); a token fee to `feeAccount` (a token
    * account of the fee mint), with `burnBps` of it burned from the payer. */
   fee: { kind: 'sol' | 'token'; account: PublicKey; amount: bigint; burnBps: number };
-  /** The last secret index the committed chain covers (requests stop there until a recommit). */
+  /** The last secret index the current chain covers (requests stop there unless a next chain is committed). */
   chainEnd: bigint;
   /** Slots after the reveal window before the fallback slot (0 = no fallback: a missed reveal fails). */
   fallbackDelaySlots: number;
   /** Draws settled by the fallback instead of a reveal (each one is a missed reveal). */
   forced: bigint;
+  /** Who may commit the next chain (never the operator). */
+  commitAuthority: PublicKey;
+  /** The next chain, committed ahead (length 0n = none); it takes over past `chainEnd`. */
+  next: { head: Buffer; length: bigint };
+  /** The only requester served; PublicKey.default = anyone. */
+  allowedRequester: PublicKey;
 }
 
 /** The accounts a fee needs, appended to a request: SOL → the fee wallet; token → the payer's token
@@ -101,8 +107,12 @@ export function initFeedIx(a: {
   timeoutSlots: number;
   /** How many secrets the chain holds (`hashChain(seed, n)` → n). */
   chainLength: bigint;
-  /** Slots after the reveal window before the fallback slot; 0 (the default) = no fallback. */
+  /** Slots after the reveal window before the fallback slot; 0 (the default) = no fallback, else at least 8. */
   fallbackDelaySlots?: number;
+  /** Who may commit later chains (`commitNextIx`): not the authority (e.g. a hardware wallet). */
+  commitAuthority: PublicKey;
+  /** The only requester this feed serves; omitted = anyone. */
+  allowedRequester?: PublicKey;
 }): TransactionInstruction {
   const feed = feedAddress(a.program, a.authority, a.id);
   const data = Buffer.concat([
@@ -113,6 +123,8 @@ export function initFeedIx(a: {
     u32(a.timeoutSlots),
     u64(a.chainLength),
     u32(a.fallbackDelaySlots ?? 0),
+    a.commitAuthority.toBuffer(),
+    (a.allowedRequester ?? PublicKey.default).toBuffer(),
   ]);
   return ix(a.program, data, [
     [a.payer, true, true],
@@ -131,6 +143,8 @@ export function requestIx(a: {
   nonce: Uint8Array;
   maxFee?: bigint;
   fee?: FeeAccounts;
+  /** The fee kind this request expects (needs `maxFee`): refused if the feed switched kind since. */
+  feeKind?: 'sol' | 'token';
 }): TransactionInstruction {
   const draw = drawAddress(a.program, a.feed, a.requester, a.nonce);
   const keys: [PublicKey, boolean, boolean][] = [
@@ -145,6 +159,7 @@ export function requestIx(a: {
     keys.push([a.fee.payerToken, false, true], [a.fee.mint, false, true], [a.fee.feeToken, false, true], [a.fee.tokenProgram, false, false]);
   const data = [Buffer.from([1]), Buffer.from(a.nonce)];
   if (a.maxFee !== undefined) data.push(u64(a.maxFee));
+  if (a.maxFee !== undefined && a.feeKind) data.push(Buffer.from([a.feeKind === 'sol' ? 0 : 1]));
   return ix(a.program, Buffer.concat(data), keys);
 }
 
@@ -196,23 +211,32 @@ export function forceSettleIx(a: { program: PublicKey; caller: PublicKey; feed: 
 export const fallbackSlot = (targetSlot: bigint, timeoutSlots: number, fallbackDelaySlots: number) =>
   targetSlot + BigInt(timeoutSlots) + BigInt(fallbackDelaySlots);
 
-export function closeDrawIx(a: { program: PublicKey; requester: PublicKey; draw: PublicKey; payer: PublicKey }): TransactionInstruction {
+/** The requester closes a draw once its secret has been revealed; its payer gets the rent back. */
+export function closeDrawIx(a: { program: PublicKey; requester: PublicKey; draw: PublicKey; payer: PublicKey; feed: PublicKey }): TransactionInstruction {
   return ix(a.program, Buffer.from([4]), [
     [a.requester, true, false],
     [a.draw, false, true],
     [a.payer, false, true],
+    [a.feed, false, false],
   ]);
 }
 
-export function recommitIx(a: { program: PublicKey; authority: PublicKey; feed: PublicKey; head: Uint8Array; chainLength: bigint }): TransactionInstruction {
+/** The commit authority commits the next chain ahead of time; it takes over past the current chain's end. */
+export function commitNextIx(a: {
+  program: PublicKey;
+  commitAuthority: PublicKey;
+  feed: PublicKey;
+  head: Uint8Array;
+  chainLength: bigint;
+}): TransactionInstruction {
   return ix(a.program, Buffer.concat([Buffer.from([5]), Buffer.from(a.head), u64(a.chainLength)]), [
-    [a.authority, true, false],
+    [a.commitAuthority, true, false],
     [a.feed, false, true],
   ]);
 }
 
 export function readFeed(data: Buffer): Feed {
-  if (data.length !== 200 || data.subarray(0, 8).toString() !== 'JBFEED02') throw new Error('not a Jumpball feed');
+  if (data.length !== 304 || data.subarray(0, 8).toString() !== 'JBFEED03') throw new Error('not a Jumpball feed');
   return {
     bump: data[8]!,
     authority: new PublicKey(data.subarray(16, 48)),
@@ -226,6 +250,9 @@ export function readFeed(data: Buffer): Feed {
     chainEnd: data.readBigUInt64LE(168),
     fallbackDelaySlots: data.readUInt32LE(176),
     forced: data.readBigUInt64LE(184),
+    commitAuthority: new PublicKey(data.subarray(192, 224)),
+    next: { head: Buffer.from(data.subarray(224, 256)), length: data.readBigUInt64LE(256) },
+    allowedRequester: new PublicKey(data.subarray(264, 296)),
     fee: {
       kind: data[162] === 1 ? 'token' : 'sol',
       account: new PublicKey(data.subarray(120, 152)),
