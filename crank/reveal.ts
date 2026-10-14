@@ -1,5 +1,8 @@
 // Reference crank: reveals a feed's draws in order as soon as each target slot has passed, with no
-// human in the loop (README "Known limitation"). Run it next to the operator key:
+// human in the loop (README "Known limitation"). It also reveals the secrets of draws that were
+// forced or failed (the result doesn't change; the chain must advance in order so later draws can be
+// revealed). Settling withheld draws is crank/settle.ts, which anyone can run. Run it next to the
+// operator key:
 //
 //   JUMPBALL_PROGRAM=<id> JUMPBALL_FEED_ID=1 JUMPBALL_SEED_FILE=seed.bin JUMPBALL_CHAIN=100000 \
 //   JUMPBALL_KEYPAIR=operator.json RPC_URL=http://127.0.0.1:8899 npx tsx crank/reveal.ts

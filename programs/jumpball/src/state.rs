@@ -10,14 +10,14 @@ use solana_program::{program_error::ProgramError, pubkey::Pubkey};
 pub const FEED_SEED: &[u8] = b"feed";
 pub const DRAW_SEED: &[u8] = b"draw";
 
-const FEED_TAG: [u8; 8] = *b"JBFEED01";
+const FEED_TAG: [u8; 8] = *b"JBFEED02";
 const DRAW_TAG: [u8; 8] = *b"JBDRAW01";
 
 /// 0 tag [8] · 8 bump u8 · 9 pad [7] · 16 authority [32] · 48 head [32] · 80 id u64 ·
 /// 88 assigned u64 · 96 revealed u64 · 104 failures u64 · 112 delay_slots u32 · 116 timeout_slots u32 ·
 /// 120 fee_account [32] · 152 fee_amount u64 · 160 burn_bps u16 · 162 fee_kind u8 · 163 pad [5] ·
-/// 168 chain_end u64 · 176 reserved [8].
-pub const FEED_LEN: usize = 184;
+/// 168 chain_end u64 · 176 fallback_delay_slots u32 · 180 pad [4] · 184 forced u64 · 192 reserved [8].
+pub const FEED_LEN: usize = 200;
 
 /// What a feed's fee is paid in: SOL to a wallet, or a token (the mint of `fee_account`), part of
 /// which may be burned.
@@ -29,7 +29,7 @@ pub enum FeeKind {
 }
 /// 0 tag [8] · 8 bump u8 · 9 status u8 · 10 pad [6] · 16 feed [32] · 48 requester [32] · 80 payer [32] ·
 /// 112 nonce [32] · 144 secret_index u64 · 152 lock_slot u64 · 160 target_slot u64 · 168 result [32] ·
-/// 200 reserved [32].
+/// 200 fallback_slot u64 · 208 reserved [24].
 pub const DRAW_LEN: usize = 232;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +38,9 @@ pub enum DrawStatus {
     Pending = 0,
     Fulfilled = 1,
     Failed = 2,
+    /// Settled by `force_settle` from slot hashes alone after the operator didn't reveal in time.
+    /// Consumers treat it like Fulfilled (it settles); only Failed means refund.
+    Forced = 3,
 }
 
 impl DrawStatus {
@@ -46,6 +49,7 @@ impl DrawStatus {
             0 => Ok(Self::Pending),
             1 => Ok(Self::Fulfilled),
             2 => Ok(Self::Failed),
+            3 => Ok(Self::Forced),
             _ => Err(ProgramError::InvalidAccountData),
         }
     }
@@ -78,6 +82,11 @@ pub struct Feed {
     /// The last secret index the committed chain covers: requests stop there until the operator
     /// commits a new chain, so no draw is ever assigned a secret that doesn't exist.
     pub chain_end: u64,
+    /// Slots after the reveal window closes before the fallback slot whose hash settles a withheld
+    /// draw (`force_settle`). 0 = no fallback: a withheld draw fails, as before.
+    pub fallback_delay_slots: u32,
+    /// Draws settled by the fallback instead of a reveal (public: each one is a missed reveal).
+    pub forced: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,8 +102,10 @@ pub struct Draw {
     pub secret_index: u64,
     pub lock_slot: u64,
     pub target_slot: u64,
-    /// The random result once fulfilled; zero otherwise.
+    /// The random result once fulfilled or forced; zero otherwise.
     pub result: [u8; 32],
+    /// For a forced draw, the produced slot whose hash settled it; 0 otherwise.
+    pub fallback_slot: u64,
 }
 
 fn u64_at(d: &[u8], at: usize) -> u64 {
@@ -131,6 +142,8 @@ impl Feed {
         out[160..162].copy_from_slice(&self.burn_bps.to_le_bytes());
         out[162] = self.fee_kind as u8;
         out[168..176].copy_from_slice(&self.chain_end.to_le_bytes());
+        out[176..180].copy_from_slice(&self.fallback_delay_slots.to_le_bytes());
+        out[184..192].copy_from_slice(&self.forced.to_le_bytes());
         Ok(())
     }
 
@@ -157,6 +170,8 @@ impl Feed {
                 _ => return Err(ProgramError::InvalidAccountData),
             },
             chain_end: u64_at(d, 168),
+            fallback_delay_slots: u32_at(d, 176),
+            forced: u64_at(d, 184),
         })
     }
 }
@@ -178,6 +193,7 @@ impl Draw {
         out[152..160].copy_from_slice(&self.lock_slot.to_le_bytes());
         out[160..168].copy_from_slice(&self.target_slot.to_le_bytes());
         out[168..200].copy_from_slice(&self.result);
+        out[200..208].copy_from_slice(&self.fallback_slot.to_le_bytes());
         Ok(())
     }
 
@@ -196,6 +212,7 @@ impl Draw {
             lock_slot: u64_at(d, 152),
             target_slot: u64_at(d, 160),
             result: b32_at(d, 168),
+            fallback_slot: u64_at(d, 200),
         })
     }
 }
@@ -221,13 +238,15 @@ mod tests {
             fee_amount: 1_000_000,
             burn_bps: 5_000,
             chain_end: 1_000,
+            fallback_delay_slots: 8,
+            forced: 2,
         };
         let mut buf = vec![0u8; FEED_LEN];
         f.write(&mut buf).unwrap();
         assert_eq!(Feed::read(&buf).unwrap(), f);
         let d = Draw {
             bump: 253,
-            status: DrawStatus::Fulfilled,
+            status: DrawStatus::Forced,
             feed: Pubkey::new_unique(),
             requester: Pubkey::new_unique(),
             payer: Pubkey::new_unique(),
@@ -236,6 +255,7 @@ mod tests {
             lock_slot: 1000,
             target_slot: 1002,
             result: [5; 32],
+            fallback_slot: 1_031,
         };
         let mut buf = vec![0u8; DRAW_LEN];
         d.write(&mut buf).unwrap();
