@@ -3,11 +3,14 @@
 //! An operator commits to a hash chain (a **feed**). A consuming program **requests** a draw, which
 //! locks at that slot and is assigned the feed's next secret. Once a slot after the lock has a
 //! hash, the operator **reveals** that secret: Jumpball checks it is the chain's next link and
-//! mixes it with the slot hash for the result. A draw not revealed in time **fails**, so the
-//! consumer can refund. See README.md for why nobody can steer a result.
+//! mixes it with the slot hash for the result. On a feed with a fallback, a draw not revealed in
+//! time is **force-settled** by anyone from a later slot's hash; without one (or if nobody settles
+//! it in the fallback window) it **fails**, so the consumer can refund. See README.md for what a
+//! withheld reveal can and can't do.
 //!
 //! Instructions (first byte):
-//! 0 `init_feed`  id u64 · head [32] · delay_slots u32 · timeout_slots u32
+//! 0 `init_feed`  id u64 · head [32] · delay_slots u32 · timeout_slots u32 · chain_length u64 ·
+//!   fallback_delay_slots u32
 //!   accounts: payer (signer, writable) · authority (signer) · feed (writable) · system program
 //! 1 `request`    nonce [32]
 //!   accounts: payer (signer, writable) · requester (signer) · feed (writable) · draw (writable) · system program
@@ -17,8 +20,12 @@
 //!   accounts: feed (writable) · draw (writable)
 //! 4 `close_draw` (none)
 //!   accounts: requester (signer) · draw (writable) · payer (writable, the draw's payer)
-//! 5 `recommit`   head [32]
+//! 5 `recommit`   head [32] · chain_length u64
 //!   accounts: authority (signer) · feed (writable)
+//! 6 `set_fee`    kind u8 · amount u64 · burn_bps u16 · fee_account [32]
+//!   accounts: authority (signer) · feed (writable)
+//! 7 `force_settle` (none)
+//!   accounts: caller (signer) · feed (writable) · draw (writable) · SlotHashes sysvar
 
 pub mod logic;
 pub mod state;
@@ -38,14 +45,18 @@ use solana_program::{
 };
 use solana_system_interface::{instruction as system_instruction, program as system_program};
 
-use crate::logic::{draw_result, first_slot_hash_from, is_next_link, timing, Timing};
+use crate::logic::{
+    draw_result, fallback_slot, first_slot_hash_from, force_timing, forced_result, is_next_link,
+    slot_settings_fit, timing, ForceTiming, Timing,
+};
 use crate::state::{Draw, DrawStatus, FeeKind, Feed, DRAW_LEN, DRAW_SEED, FEED_LEN, FEED_SEED};
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
-/// Longest wait for a reveal a feed may set: the SlotHashes sysvar keeps the last 512 slots, so a
-/// later reveal could no longer find its slot's hash.
+/// The most slots a feed's settings may span (delay + reveal window, plus the fallback's delay and
+/// window when it has one): the SlotHashes sysvar keeps the last 512 slots, so a later reveal or
+/// force_settle could no longer find the hashes it needs. 400 leaves headroom under 512.
 pub const MAX_TIMEOUT_SLOTS: u32 = 400;
 
 /// Errors, as `ProgramError::Custom(n)`.
@@ -75,6 +86,10 @@ pub enum JumpballError {
     FeeTooHigh = 11,
     /// The committed chain's secrets are all assigned: the operator must commit a new chain.
     ChainExhausted = 12,
+    /// The feed has no fallback (`fallback_delay_slots` is 0): a withheld draw can only be expired.
+    FallbackDisabled = 13,
+    /// The fallback window has closed: the draw can only be expired (refund).
+    FallbackClosed = 14,
 }
 
 /// The two token programs a token fee may use (the same TransferChecked and BurnChecked layouts).
@@ -103,6 +118,7 @@ pub fn process_instruction(
         4 => close_draw(program_id, accounts),
         5 => recommit(program_id, accounts, data),
         6 => set_fee(program_id, accounts, data),
+        7 => force_settle(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -162,15 +178,19 @@ fn init_feed(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
     let timeout_slots = u32_at(data, 44)?;
     // How many secrets the chain holds (links after the head).
     let chain_length = u64_at(data, 48)?;
+    // Slots after the reveal window before the fallback slot (0 = no fallback).
+    let fallback_delay_slots = u32_at(data, 56)?;
     if chain_length == 0 {
         return Err(JumpballError::BadSetting.into());
     }
     // At least one slot of delay (the lock slot's own hash is known to its leader), and a reveal
-    // window that stays inside what SlotHashes remembers.
-    if delay_slots == 0
-        || timeout_slots == 0
-        || delay_slots.saturating_add(timeout_slots) > MAX_TIMEOUT_SLOTS
-    {
+    // window (and fallback, if any) that stays inside what SlotHashes remembers.
+    if !slot_settings_fit(
+        delay_slots,
+        timeout_slots,
+        fallback_delay_slots,
+        MAX_TIMEOUT_SLOTS,
+    ) {
         return Err(JumpballError::BadSetting.into());
     }
     let id_bytes = id.to_le_bytes();
@@ -203,6 +223,8 @@ fn init_feed(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Prog
         fee_amount: 0,
         burn_bps: 0,
         chain_end: chain_length,
+        fallback_delay_slots,
+        forced: 0,
     }
     .write(&mut feed_acc.try_borrow_mut_data()?)?;
     msg!("jumpball: feed {} committed", id);
@@ -281,6 +303,7 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progra
         lock_slot: now,
         target_slot: now + feed.delay_slots as u64,
         result: [0; 32],
+        fallback_slot: 0,
     };
     draw.write(&mut draw_acc.try_borrow_mut_data()?)?;
     feed.write(&mut feed_acc.try_borrow_mut_data()?)?;
@@ -494,14 +517,18 @@ fn reveal(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
                 &draw.result,
             ]);
         }
-        // Too late: the draw fails (the consumer refunds), and the secret still advances the chain
-        // so later draws can be revealed.
-        (DrawStatus::Pending, Timing::TimedOut) => {
+        // Too late, no fallback: the draw fails (the consumer refunds), and the secret still advances
+        // the chain so later draws can be revealed.
+        (DrawStatus::Pending, Timing::TimedOut) if feed.fallback_delay_slots == 0 => {
             draw.status = DrawStatus::Failed;
             feed.failures += 1;
         }
-        // Already failed by `expire`: the reveal only advances the chain.
-        (DrawStatus::Failed, _) => {}
+        // Too late on a feed with a fallback: the draw stays pending for `force_settle` (a late
+        // reveal must not fail it, or the operator could turn a withheld draw into a refund). The
+        // secret only advances the chain.
+        (DrawStatus::Pending, Timing::TimedOut) => {}
+        // Already forced or failed: the reveal never changes the result, it only advances the chain.
+        (DrawStatus::Forced, _) | (DrawStatus::Failed, _) => {}
         (DrawStatus::Fulfilled, _) => return Err(JumpballError::NotPending.into()),
     }
     feed.head = secret;
@@ -512,8 +539,8 @@ fn reveal(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Program
     Ok(())
 }
 
-/// Anyone may fail a draw whose reveal window has closed, so a consumer can refund without waiting
-/// on the operator.
+/// Anyone may fail a draw whose reveal window has closed (and, on a feed with a fallback, whose
+/// fallback window has closed too), so a consumer can refund without waiting on the operator.
 fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let it = &mut accounts.iter();
     let feed_acc = next_account_info(it)?;
@@ -523,7 +550,18 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if draw.status != DrawStatus::Pending {
         return Err(JumpballError::NotPending.into());
     }
-    if timing(Clock::get()?.slot, draw.target_slot, feed.timeout_slots) != Timing::TimedOut {
+    let now = Clock::get()?.slot;
+    let timed_out = if feed.fallback_delay_slots == 0 {
+        timing(now, draw.target_slot, feed.timeout_slots) == Timing::TimedOut
+    } else {
+        force_timing(
+            now,
+            draw.target_slot,
+            feed.timeout_slots,
+            feed.fallback_delay_slots,
+        ) == ForceTiming::Closed
+    };
+    if !timed_out {
         return Err(JumpballError::NotTimedOut.into());
     }
     draw.status = DrawStatus::Failed;
@@ -532,6 +570,83 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     feed.write(&mut feed_acc.try_borrow_mut_data()?)?;
     msg!(
         "jumpball: draw {} failed (no reveal in time)",
+        draw.secret_index
+    );
+    Ok(())
+}
+
+/// Anyone settles a withheld draw from slot hashes alone, once its reveal window has closed and the
+/// fallback slot has passed: result = H("jumpball:forced" ‖ target slot hash ‖ fallback slot hash ‖
+/// draw). See `logic::forced_result` for why this can't be steered, and what it does allow (one
+/// re-roll per withheld draw, publicly counted).
+fn force_settle(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let it = &mut accounts.iter();
+    let caller = next_account_info(it)?;
+    let feed_acc = next_account_info(it)?;
+    let draw_acc = next_account_info(it)?;
+    let slot_hashes = next_account_info(it)?;
+    if !caller.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *slot_hashes.key != sysvar::slot_hashes::ID {
+        return Err(JumpballError::WrongAccount.into());
+    }
+    let mut feed = load_feed(program_id, feed_acc)?;
+    let mut draw = load_draw(program_id, draw_acc, feed_acc.key)?;
+    if draw.status != DrawStatus::Pending {
+        return Err(JumpballError::NotPending.into());
+    }
+    if feed.fallback_delay_slots == 0 {
+        return Err(JumpballError::FallbackDisabled.into());
+    }
+    match force_timing(
+        Clock::get()?.slot,
+        draw.target_slot,
+        feed.timeout_slots,
+        feed.fallback_delay_slots,
+    ) {
+        ForceTiming::TooEarly => return Err(JumpballError::TooEarly.into()),
+        ForceTiming::Closed => return Err(JumpballError::FallbackClosed.into()),
+        ForceTiming::Open => {}
+    }
+    let data = slot_hashes.try_borrow_data()?;
+    // The first produced slot at or after each: a skipped slot rolls on to the next one.
+    let (fallback_used, fallback_hash) = first_slot_hash_from(
+        &data,
+        fallback_slot(
+            draw.target_slot,
+            feed.timeout_slots,
+            feed.fallback_delay_slots,
+        ),
+    )
+    .ok_or(JumpballError::SlotHashUnavailable)?;
+    // Still in the sysvar: the feed's settings are capped so the whole fallback window fits.
+    let (target_used, target_hash) =
+        first_slot_hash_from(&data, draw.target_slot).ok_or(JumpballError::SlotHashUnavailable)?;
+    drop(data);
+    draw.result = forced_result(&target_hash, &fallback_hash, draw_acc.key);
+    draw.status = DrawStatus::Forced;
+    draw.fallback_slot = fallback_used;
+    feed.forced = feed
+        .forced
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    draw.write(&mut draw_acc.try_borrow_mut_data()?)?;
+    feed.write(&mut feed_acc.try_borrow_mut_data()?)?;
+    // Everything needed to re-check the draw from the logs alone, like a reveal.
+    sol_log_data(&[
+        b"jumpball",
+        b"forced",
+        draw_acc.key.as_ref(),
+        &draw.secret_index.to_le_bytes(),
+        &target_used.to_le_bytes(),
+        &target_hash,
+        &fallback_used.to_le_bytes(),
+        &fallback_hash,
+        &draw.result,
+    ]);
+    msg!(
+        "jumpball: draw {} forced (no reveal in time)",
         draw.secret_index
     );
     Ok(())
