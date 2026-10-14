@@ -60,7 +60,7 @@ impl DrawStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Feed {
     pub bump: u8,
-    /// Who reveals secrets and can recommit a new chain.
+    /// Who reveals secrets (the operator). Later chains are committed by `commit_authority`.
     pub authority: Pubkey,
     /// The last revealed secret, or the chain's committed end before any reveal.
     pub head: [u8; 32],

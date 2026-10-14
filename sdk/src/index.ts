@@ -30,7 +30,7 @@ export interface Feed {
   /** Per request: 0 = free. SOL goes to `feeAccount` (a wallet); a token fee to `feeAccount` (a token
    * account of the fee mint), with `burnBps` of it burned from the payer. */
   fee: { kind: 'sol' | 'token'; account: PublicKey; amount: bigint; burnBps: number };
-  /** The last secret index the committed chain covers (requests stop there until a recommit). */
+  /** The last secret index the current chain covers (requests stop there unless a next chain is committed). */
   chainEnd: bigint;
   /** Slots after the reveal window before the fallback slot (0 = no fallback: a missed reveal fails). */
   fallbackDelaySlots: number;
