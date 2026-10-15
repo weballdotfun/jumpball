@@ -2,7 +2,7 @@
 
 Provably fair, low-cost randomness for Solana programs. Built by [WeBall](https://weball.fun).
 
-> Status: **live on Solana mainnet** since 15 October 2026, from commit `1ef830b` (verified build below). Run by WeBall.
+> Status: **live on Solana mainnet** since 15 October 2026; upgraded the same day to commit `383f3d6` (verified build below). Run by WeBall.
 
 ## Why
 
@@ -185,7 +185,7 @@ program can be checked against this source with
 ```
 solana-verify verify-from-repo -u mainnet-beta \
   --program-id HdTE57SKuE4MrzYaBSxV3BaFe6wmmaKg2ZNkj2vB6EeF \
-  https://github.com/weballdotfun/jumpball --commit-hash 1ef830b --library-name jumpball
+  https://github.com/weballdotfun/jumpball --commit-hash 383f3d6 --library-name jumpball
 ```
 
 ## Deployments
@@ -193,7 +193,7 @@ solana-verify verify-from-repo -u mainnet-beta \
 | | Mainnet | Devnet |
 |---|---|---|
 | Program | `HdTE57SKuE4MrzYaBSxV3BaFe6wmmaKg2ZNkj2vB6EeF` | `HdTE57SKuE4MrzYaBSxV3BaFe6wmmaKg2ZNkj2vB6EeF` |
-| Build hash (solana-verify) | `59de435bc98d887a12af196e3004035d4ae899c0c4bb43050e385b54bd343968` | the same |
+| Build hash (solana-verify) | `bc51da1aa8691687b3b7fa005b8c3c61971f36804386ae6c316e25b2d66df57d` | the same |
 | Public feed (anyone may request) | `9gUP1auXn32SxVUFBhmxLHRqXopMZbcbgpSJiFV431gi` | `BYuArpjuNgKDQFXxEdwrya9Ln78JQhhVoff64T8EEgi5` |
 | Operator (reveals) | `D1B6EoZR2iiQimKJG2gAJ9S2R4FsKFT5Vk61WzfPF2sF` | `F5Tt4m6a2N8ancPrSzXfK4zTnVq2ZN3WUCEGtgeSuuNr` |
 | Commit authority (new chains) | `FMNESfSXP26r64c5VPYQe7F81e3Z9zohPebVnyXUGdKy` (hardware wallet) | `D1VUxoRU6iuteWSyNoFpspBjk9FQh7QEn9JXubDuW6QY` |
