@@ -2,7 +2,7 @@
 
 Provably fair, low-cost randomness for Solana programs. Built by [WeBall](https://weball.fun).
 
-> Status: in development. Not deployed yet. Do not rely on it until a verified mainnet release is announced here.
+> Status: **live on Solana mainnet** since 15 October 2026, from commit `1ef830b` (verified build below). Run by WeBall.
 
 ## Why
 
@@ -168,14 +168,36 @@ npm install && bash tests/run-localnet.sh   # end-to-end on its own local valida
 
 ## Verifying a deployment
 
-Every release is built reproducibly. The deployed program can be checked against this source with
-[solana-verify](https://github.com/Ellipsis-Labs/solana-verifiable-build), and its address and build
-hash will be listed here.
+Every release is built reproducibly in `solanafoundation/solana-verifiable-build:4.2.2`. The deployed
+program can be checked against this source with
+[solana-verify](https://github.com/Ellipsis-Labs/solana-verifiable-build):
+
+```
+solana-verify verify-from-repo -u mainnet-beta \
+  --program-id HdTE57SKuE4MrzYaBSxV3BaFe6wmmaKg2ZNkj2vB6EeF \
+  https://github.com/weballdotfun/jumpball --commit-hash 1ef830b --library-name jumpball
+```
+
+## Deployments
+
+| | Mainnet | Devnet |
+|---|---|---|
+| Program | `HdTE57SKuE4MrzYaBSxV3BaFe6wmmaKg2ZNkj2vB6EeF` | `HdTE57SKuE4MrzYaBSxV3BaFe6wmmaKg2ZNkj2vB6EeF` |
+| Build hash (solana-verify) | `59de435bc98d887a12af196e3004035d4ae899c0c4bb43050e385b54bd343968` | the same |
+| Public feed (anyone may request) | `9gUP1auXn32SxVUFBhmxLHRqXopMZbcbgpSJiFV431gi` | `BYuArpjuNgKDQFXxEdwrya9Ln78JQhhVoff64T8EEgi5` |
+| Operator (reveals) | `D1B6EoZR2iiQimKJG2gAJ9S2R4FsKFT5Vk61WzfPF2sF` | `F5Tt4m6a2N8ancPrSzXfK4zTnVq2ZN3WUCEGtgeSuuNr` |
+| Commit authority (new chains) | `FMNESfSXP26r64c5VPYQe7F81e3Z9zohPebVnyXUGdKy` (hardware wallet) | `D1VUxoRU6iuteWSyNoFpspBjk9FQh7QEn9JXubDuW6QY` |
+| Upgrade authority | `CCYReQ6R2p8FKR8KmM5fftxaKD1KY5XGsHa1kXKgrBaH` (hardware wallet) | a test key |
+
+The mainnet public feed reveals 2 slots after a draw's target, with a 150-slot reveal window and the
+fallback 8 slots after it. Its fee is $0.10 worth of $BALL (`6R55kUofnvSoFonSQjb7Un3E4bWCxwc4E7dMFDWWLm3s`)
+per request, half burned, repriced as $BALL's price moves; a request's `max_fee` caps what it pays.
+Live numbers and the latest draws: [weball.fun/jumpball](https://weball.fun/jumpball).
 
 ## Security
 
 Please report vulnerabilities privately to team@weball.fun rather than in public issues. A bug
-bounty will be announced with the mainnet release.
+bounty will be announced here.
 
 ## Licence
 
