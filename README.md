@@ -20,7 +20,8 @@ hash nobody knows in advance.
 2. **Lock.** A consuming program (a game) locks a draw at slot `L`: from this point no more entries
    are accepted. The draw will use the hash of a slot after `L`, which nobody can know yet.
 3. **Reveal.** The operator reveals the next secret `s_i`. Jumpball checks `H(s_i) == s_{i-1}` and
-   computes the result as `H(s_i || slot_hash(L + k))`.
+   computes the result as `H("jumpball" || s_i || slot_hash(L + k) || draw)`, the draw being the
+   draw account's address.
 4. **Timeout and fallback.** If the reveal doesn't arrive within the reveal window, a feed with a
    fallback (`fallback_delay_slots` > 0) settles the draw anyway: once a later **fallback slot**
    has passed, anyone calls `force_settle`, and the result is
@@ -33,8 +34,9 @@ What each party can and can't do:
 
 - **The operator** committed to its secrets before any draw and can't change them. It also can't
   know the slot hash when entries close.
-- **A validator** can influence a slot hash only by skipping its slot, and it doesn't know the
-  operator's secret, so it can't tell which slot hash would help.
+- **A validator** producing the target slot can vary that slot's hash (by skipping it, or by
+  changing its block), but it doesn't know the operator's secret, so it can't tell which slot hash
+  would help.
 - **Someone holding the secrets** still doesn't know the slot hash while entries are open.
 - **Withholding a reveal** can't pick an outcome either: on a feed with a fallback it re-rolls the
   draw once from slot hashes nobody knows yet (see "Known limitation"), and without one it fails the
@@ -46,7 +48,10 @@ Every fulfilled reveal logs its inputs and result (`Program data: jumpball revea
 <secret> <slot> <slot hash> <result>`), so a draw can be re-checked from the transaction alone, even
 after its account is closed. The SDK's `parseRevealLog` reads it and `checkReveal` confirms that the
 secret hashes to the link committed before it and that the result is
-`H("jumpball" ‖ secret ‖ slot hash ‖ draw)`.
+`H("jumpball" ‖ secret ‖ slot hash ‖ draw)`. Pass Jumpball's program id to the parsers: they then
+read only lines Jumpball itself logged, since any program in a transaction can log a look-alike
+line. A check that relies on the result alone should also confirm the transaction invoked Jumpball
+and that the draw address matches the draw being checked.
 
 A forced draw logs its inputs the same way (`Program data: jumpball forced <draw> <index> <target
 slot> <target hash> <fallback slot> <fallback hash> <result>`, the slots being the produced slots
@@ -103,7 +108,8 @@ publicly counted.**
 - A forced draw relies only on slot hashes, with no secret in it. The leader producing the fallback slot
   can vary its block to try many slot hashes and pick a result it likes before publishing: real control,
   not just skipping. That is why the fallback delay is at least 8 slots (two leader windows), so the
-  fallback slot is never produced by the leader of the reveal window's last slot; it also means every
+  fallback slot falls in a different leader window from the reveal window's last slot. The same
+  validator can hold consecutive windows, so this separates leaders usually, not always. It also means every
   forced draw is a weaker draw. A skipped fallback slot rolls on to the next produced slot, as target
   slots do. Treat a rising `forced` count as an incident.
 - On a feed without a fallback (`fallback_delay_slots` = 0) a missed reveal fails the draw and the
@@ -118,6 +124,9 @@ loop, and anyone can run the settler (`crank/settle.ts`).
 - **Operator and validator together:** an operator colluding with the leader of a draw's target slot
   can choose that draw's result (the leader knows the secret and can vary the slot hash). Each alone
   can't.
+- **Operator and fallback leader together:** an operator who withholds a reveal, colluding with the
+  leader of the fallback slot, gets a choice between the revealed result R and a fallback result F
+  that leader has ground. Small per-draw values and a public `forced` count are the defence.
 - **The seed:** whoever holds an operator's chain seed knows each draw's result as soon as its target
   slot exists. That is safe only if the consumer allows no action between locking a draw and settling
   it (Shot Clock allows none).
