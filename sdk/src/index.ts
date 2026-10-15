@@ -143,9 +143,14 @@ export function requestIx(a: {
   nonce: Uint8Array;
   maxFee?: bigint;
   fee?: FeeAccounts;
-  /** The fee kind this request expects (needs `maxFee`): refused if the feed switched kind since. */
+  /**
+   * The fee kind this request expects: refused if the feed switched kind since. With `maxFee` it
+   * defaults to `fee.kind`, so a paid request always binds the kind it read; one of the two is required.
+   */
   feeKind?: 'sol' | 'token';
 }): TransactionInstruction {
+  const feeKind = a.feeKind ?? a.fee?.kind;
+  if (a.maxFee !== undefined && !feeKind) throw new Error('requestIx: maxFee needs feeKind or fee (the fee kind the payer agreed to)');
   const draw = drawAddress(a.program, a.feed, a.requester, a.nonce);
   const keys: [PublicKey, boolean, boolean][] = [
     [a.payer, true, true],
@@ -159,7 +164,7 @@ export function requestIx(a: {
     keys.push([a.fee.payerToken, false, true], [a.fee.mint, false, true], [a.fee.feeToken, false, true], [a.fee.tokenProgram, false, false]);
   const data = [Buffer.from([1]), Buffer.from(a.nonce)];
   if (a.maxFee !== undefined) data.push(u64(a.maxFee));
-  if (a.maxFee !== undefined && a.feeKind) data.push(Buffer.from([a.feeKind === 'sol' ? 0 : 1]));
+  if (a.maxFee !== undefined) data.push(Buffer.from([feeKind === 'sol' ? 0 : 1]));
   return ix(a.program, Buffer.concat(data), keys);
 }
 
@@ -292,6 +297,29 @@ export function hashChain(seed: Uint8Array, length: number): Buffer[] {
 
 export const newSeed = () => randomBytes(32);
 
+/**
+ * The `Program data:` lines a given program itself wrote, following the runtime's invoke/success
+ * lines. Any program can log a look-alike line, so a verifier should pass Jumpball's program id.
+ */
+export function programDataLines(logs: readonly string[], program?: PublicKey): string[] {
+  const id = program?.toBase58();
+  const stack: string[] = [];
+  const out: string[] = [];
+  for (const line of logs) {
+    const invoke = /^Program (\S+) invoke \[\d+\]$/.exec(line);
+    if (invoke) {
+      stack.push(invoke[1]!);
+      continue;
+    }
+    if (/^Program \S+ (success|failed)/.test(line)) {
+      stack.pop();
+      continue;
+    }
+    if (line.startsWith('Program data: ') && (!id || stack[stack.length - 1] === id)) out.push(line);
+  }
+  return out;
+}
+
 /** A fulfilled draw as its reveal logged it ("Program data: jumpball reveal …"). */
 export interface RevealLog {
   draw: PublicKey;
@@ -302,10 +330,12 @@ export interface RevealLog {
   result: Buffer;
 }
 
-/** Reads the reveal event from a transaction's log lines, if it has one. */
-export function parseRevealLog(logs: readonly string[]): RevealLog | null {
-  for (const line of logs) {
-    if (!line.startsWith('Program data: ')) continue;
+/**
+ * Reads the reveal event from a transaction's log lines, if it has one. Pass `program` (Jumpball's id)
+ * to count only lines Jumpball itself wrote; without it, a transaction from anyone can spoof one.
+ */
+export function parseRevealLog(logs: readonly string[], program?: PublicKey): RevealLog | null {
+  for (const line of programDataLines(logs, program)) {
     const f = line.slice(14).split(' ').map((p) => Buffer.from(p, 'base64'));
     if (f[0]?.toString() !== 'jumpball' || f[1]?.toString() !== 'reveal' || f.length !== 8) continue;
     return { draw: new PublicKey(f[2]!), index: f[3]!.readBigUInt64LE(0), secret: f[4]!, slot: f[5]!.readBigUInt64LE(0), slotHash: f[6]!, result: f[7]! };
@@ -338,10 +368,12 @@ export interface ForcedLog {
   result: Buffer;
 }
 
-/** Reads the forced-settle event from a transaction's log lines, if it has one. */
-export function parseForcedLog(logs: readonly string[]): ForcedLog | null {
-  for (const line of logs) {
-    if (!line.startsWith('Program data: ')) continue;
+/**
+ * Reads the forced-settle event from a transaction's log lines, if it has one. Pass `program`
+ * (Jumpball's id) to count only lines Jumpball itself wrote.
+ */
+export function parseForcedLog(logs: readonly string[], program?: PublicKey): ForcedLog | null {
+  for (const line of programDataLines(logs, program)) {
     const f = line.slice(14).split(' ').map((p) => Buffer.from(p, 'base64'));
     if (f[0]?.toString() !== 'jumpball' || f[1]?.toString() !== 'forced' || f.length !== 9) continue;
     return {

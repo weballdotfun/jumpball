@@ -115,7 +115,7 @@ console.log('crank revealed draw 5');
 // The reveal's log alone re-checks the draw: secret 5 hashes to secret 4 and the result matches.
 {
   const tx = await conn.getTransaction((r as { signature: string }).signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
-  const log = parseRevealLog(tx!.meta!.logMessages!);
+  const log = parseRevealLog(tx!.meta!.logMessages!, PROGRAM_ID);
   assert.ok(log && log.index === 5n, 'the reveal logged draw 5');
   assert.deepEqual(checkReveal(log!, links[4]!), { chainOk: true, resultOk: true });
   assert.ok((await conn.getAccountInfo(e.draw, 'confirmed'))!.data.subarray(168, 200).equals(log!.result), 'the log matches the account');
@@ -262,7 +262,7 @@ console.log('crank revealed draw 5');
   assert.equal(forcedDraw.status, DrawStatus.Forced);
   assert.ok(forcedDraw.fallbackSlot >= BigInt(b2.fallback), 'the fallback slot (or the next produced one) is recorded');
   const tx = await conn.getTransaction(sig, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
-  const log = parseForcedLog(tx!.meta!.logMessages!);
+  const log = parseForcedLog(tx!.meta!.logMessages!, PROGRAM_ID);
   assert.ok(log && log.index === 2n && log.draw.equals(b2.draw), 'force_settle logged draw 2');
   assert.deepEqual(checkForced(log!, { timeoutSlots: TIMEOUT, fallbackDelaySlots: FALLBACK, drawTargetSlot: BigInt(b2.target) }), { resultOk: true, slotsOk: true });
   assert.ok(log!.result.equals(forcedDraw.result) && log!.fallbackSlot === forcedDraw.fallbackSlot, 'the log matches the account');
