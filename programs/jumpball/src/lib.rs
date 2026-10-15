@@ -94,7 +94,7 @@ pub enum JumpballError {
     /// The draw's secret hasn't been revealed yet: closing it would leave the chain without the account
     /// its reveal needs (the internal review, 14 Oct 2026).
     NotRevealedYet = 15,
-    /// A next chain is already committed (it can't be replaced: draws may already be assigned to it).
+    /// A next chain is already committed and a draw is assigned to it, so it can't be replaced.
     NextChainPending = 16,
     /// The request expected another kind of fee than the feed charges.
     FeeKindChanged = 17,
@@ -740,7 +740,8 @@ fn close_draw(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 
 /// The commit authority (not the operator: the founder's hardware wallet, 14 Oct 2026) commits the next
 /// chain ahead of time. It takes over at the first reveal past `chain_end`, so draws never wait for an
-/// idle feed. It can't be replaced once committed: draws may already be assigned to its secrets.
+/// idle feed. It can be replaced only while no draw is assigned past `chain_end` (none uses its
+/// secrets yet), so a wrong commit can be corrected (audit J-3, 15 Oct 2026); after that it's fixed.
 fn commit_next(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let it = &mut accounts.iter();
     let commit_authority = next_account_info(it)?;
@@ -752,7 +753,7 @@ fn commit_next(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     if feed.commit_authority != *commit_authority.key {
         return Err(JumpballError::Unauthorized.into());
     }
-    if feed.next_length > 0 {
+    if feed.next_length > 0 && feed.assigned > feed.chain_end {
         return Err(JumpballError::NextChainPending.into());
     }
     let chain_length = u64_at(data, 32)?;
@@ -763,7 +764,7 @@ fn commit_next(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     feed.next_length = chain_length;
     feed.write(&mut feed_acc.try_borrow_mut_data()?)?;
     msg!(
-        "jumpball: feed {} next chain committed ({} secrets after {})",
+        "jumpball: feed {} next chain committed ({} secrets after {}; replaceable until a draw is assigned to it)",
         feed.id,
         chain_length,
         feed.chain_end
