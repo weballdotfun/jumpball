@@ -189,15 +189,19 @@ console.log('crank revealed draw 5');
   // by the commit authority.
   const fresh = hashChain(randomBytes(32), 5);
   await conn.confirmTransaction(await conn.requestAirdrop(committer.publicKey, 1e9), 'confirmed');
-  const commit = (signer: Keypair, chainLength: bigint) =>
-    send(commitNextIx({ program: PROGRAM_ID, commitAuthority: signer.publicKey, feed, head: fresh[0]!, chainLength }), signer);
+  const commit = (signer: Keypair, chainLength: bigint, head = fresh[0]!) =>
+    send(commitNextIx({ program: PROGRAM_ID, commitAuthority: signer.publicKey, feed, head, chainLength }), signer);
   await custom(commit(operator, 5n), 8); // Unauthorized: the operator can't commit chains
   await custom(commit(committer, 0n), 10);
   const before = await feedNow();
   assert.ok(before.revealed < before.assigned, 'draws are waiting');
+  // A wrong next chain can be replaced while no draw uses it yet (audit J-3)...
+  await commit(committer, 7n, hashChain(randomBytes(32), 7)[0]!);
   await commit(committer, 5n);
-  await custom(commit(committer, 5n), 16); // NextChainPending: can't be replaced
+  assert.ok((await feedNow()).next.head.equals(fresh[0]!), 'the replacement took');
   await req(); // requests resume at once, into the next chain
+  // ...and not once a draw is assigned to its secrets.
+  await custom(commit(committer, 5n), 16); // NextChainPending
   for (let i = 0; i < 400 && (await feedNow()).revealed < (await feedNow()).assigned; i++) {
     const r = await revealNext(conn, PROGRAM_ID, operator, id, links, fresh);
     if (typeof r !== 'object') await new Promise((res) => setTimeout(res, 300));
@@ -206,7 +210,7 @@ console.log('crank revealed draw 5');
   assert.equal(done.revealed, done.assigned, 'every waiting draw revealed or failed, across the switch');
   assert.equal(done.chainEnd, before.chainEnd + 5n, 'the next chain took over');
   assert.equal(done.next.length, 0n);
-  console.log('chain ran out: next chain committed ahead by the commit authority, requests resumed, reveals crossed the switch');
+  console.log('chain ran out: next chain committed ahead by the commit authority (replaceable until used), requests resumed, reveals crossed the switch');
 }
 // 8. The slot-hash fallback: a feed with fallback_delay_slots settles withheld draws from slot hashes.
 {

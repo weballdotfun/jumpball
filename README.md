@@ -66,7 +66,8 @@ equal a revealed one.
 A feed knows how many secrets its committed chain holds (`chain_end`). The feed's **commit authority**,
 a key apart from the operator (ours is on a hardware wallet), commits the next chain ahead of time
 with `commit_next`: requests may then run on into it, and the first reveal past `chain_end` switches
-to it. A committed next chain can't be replaced (draws may already be assigned to it), and the
+to it. A committed next chain can be replaced only until the first draw is assigned past `chain_end`
+(after that, draws use its secrets), so a wrong commit can be corrected in time. The
 operator can't commit chains at all, so a stolen operator key can't commit a chain nobody can reveal.
 Without a next chain, requests stop at `chain_end` (`ChainExhausted`); a draw is never assigned a
 secret that doesn't exist.
